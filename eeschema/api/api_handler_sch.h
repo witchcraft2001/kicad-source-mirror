@@ -201,6 +201,12 @@ private:
     HANDLER_RESULT<commands::ExpandTextVariablesResponse>
     handleExpandTextVariables( const HANDLER_CONTEXT<commands::ExpandTextVariables>& aCtx );
 
+    HANDLER_RESULT<kiapi::schematic::commands::AnnotateSchematicResponse>
+    handleAnnotateSchematic( const HANDLER_CONTEXT<kiapi::schematic::commands::AnnotateSchematic>& aCtx );
+
+    HANDLER_RESULT<kiapi::schematic::commands::SymbolPinsResponse>
+    handleGetSymbolPins( const HANDLER_CONTEXT<kiapi::schematic::commands::GetSymbolPins>& aCtx );
+
     HANDLER_RESULT<kiapi::common::commands::PlaceFromLibraryResponse> handlePlaceSymbolFromLibrary(
             const HANDLER_CONTEXT<kiapi::schematic::commands::PlaceSymbolFromLibrary>& aCtx );
     HANDLER_RESULT<kiapi::common::tasks::StartTaskResponse> handleStartErcTask(

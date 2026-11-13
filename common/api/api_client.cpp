@@ -26,12 +26,28 @@
 #include <wx/translation.h>
 
 
+/// nng 2.x takes an nng_err enum in nng_strerror, nng 1.x takes an int.
+static const char* nngErrorString( int aCode )
+{
+#if NNG_MAJOR_VERSION >= 2
+    return nng_strerror( static_cast<nng_err>( aCode ) );
+#else
+    return nng_strerror( aCode );
+#endif
+}
+
+
 KICAD_API_CLIENT::KICAD_API_CLIENT( int aTimeoutMs, bool aBlock ) :
         m_socket(),
         m_isOpen( false ),
         m_isConnected( false ),
         m_block( aBlock )
 {
+#if NNG_MAJOR_VERSION >= 2
+    // nng 2.x must be initialized before any other call; repeated calls are harmless
+    nng_init( nullptr );
+#endif
+
     int ret = nng_req0_open( &m_socket );
 
     if( ret == 0 )
@@ -42,7 +58,7 @@ KICAD_API_CLIENT::KICAD_API_CLIENT( int aTimeoutMs, bool aBlock ) :
     }
     else
     {
-        m_lastError = wxString::Format( wxS( "nng_req0_open failed: %s" ), wxString::FromUTF8( nng_strerror( ret ) ) );
+        m_lastError = wxString::Format( wxS( "nng_req0_open failed: %s" ), wxString::FromUTF8( nngErrorString( ret ) ) );
     }
 }
 
@@ -66,7 +82,7 @@ bool KICAD_API_CLIENT::Connect( const wxString& aSocketUrl )
 
     if( ret != 0 )
     {
-        m_lastError = wxString::Format( wxS( "nng_dial failed: %s" ), wxString::FromUTF8( nng_strerror( ret ) ) );
+        m_lastError = wxString::Format( wxS( "nng_dial failed: %s" ), wxString::FromUTF8( nngErrorString( ret ) ) );
         return false;
     }
 
@@ -114,39 +130,29 @@ bool KICAD_API_CLIENT::Send( const google::protobuf::Message& aRequest, kiapi::c
     }
 
     std::string requestStr = request.SerializeAsString();
-    void*       sendBuf = nng_alloc( requestStr.size() );
 
-    if( !sendBuf )
-    {
-        m_lastError = wxS( "nng_alloc failed" );
-        return false;
-    }
-
-    std::memcpy( sendBuf, requestStr.data(), requestStr.size() );
-
-    int ret = nng_send( m_socket, sendBuf, requestStr.size(), NNG_FLAG_ALLOC );
+    // nng copies the buffer, which keeps this compatible with nng 2.x (no NNG_FLAG_ALLOC)
+    int ret = nng_send( m_socket, requestStr.data(), requestStr.size(), 0 );
 
     if( ret != 0 )
     {
-        nng_free( sendBuf, requestStr.size() );
-        m_lastError = wxString::Format( wxS( "nng_send failed: %s" ), wxString::FromUTF8( nng_strerror( ret ) ) );
+        m_lastError = wxString::Format( wxS( "nng_send failed: %s" ), wxString::FromUTF8( nngErrorString( ret ) ) );
         return false;
     }
 
-    char*  reply = nullptr;
-    size_t replySize = 0;
-    int    flags = m_block ? 0 : NNG_FLAG_NONBLOCK;
+    nng_msg* reply = nullptr;
+    int      flags = m_block ? 0 : NNG_FLAG_NONBLOCK;
 
-    ret = nng_recv( m_socket, &reply, &replySize, NNG_FLAG_ALLOC | flags );
+    ret = nng_recvmsg( m_socket, &reply, flags );
 
     if( ret != 0 )
     {
-        m_lastError = wxString::Format( wxS( "nng_recv failed: %s" ), wxString::FromUTF8( nng_strerror( ret ) ) );
+        m_lastError = wxString::Format( wxS( "nng_recv failed: %s" ), wxString::FromUTF8( nngErrorString( ret ) ) );
         return false;
     }
 
-    std::string responseStr( reply, replySize );
-    nng_free( reply, replySize );
+    std::string responseStr( static_cast<const char*>( nng_msg_body( reply ) ), nng_msg_len( reply ) );
+    nng_msg_free( reply );
 
     if( !aResponse.ParseFromString( responseStr ) )
     {

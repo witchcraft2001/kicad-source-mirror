@@ -29,6 +29,7 @@
 #include <api/common/envelope.pb.h>
 #include <api/common/tasks.pb.h>
 #include <api/headless_sch_context.h>
+#include <api/schematic/schematic_commands.pb.h>
 #include <api/schematic/schematic_tasks.pb.h>
 #include <api/schematic/schematic_types.pb.h>
 #include <schematic_utils/schematic_file_util.h>
@@ -40,7 +41,9 @@
 #include <sch_label.h>
 #include <sch_line.h>
 #include <sch_screen.h>
+#include <sch_pin.h>
 #include <sch_sheet.h>
+#include <sch_symbol.h>
 #include <set>
 #include <scoped_set_reset.h>
 
@@ -711,5 +714,215 @@ BOOST_AUTO_TEST_CASE( GetErcTaskResultRejectsUnknownToken )
     BOOST_REQUIRE( !result.has_value() );
     BOOST_CHECK_EQUAL( result.error().status(), kiapi::common::ApiStatusCode::AS_BAD_REQUEST );
 }
+
+namespace
+{
+
+kiapi::schematic::commands::SymbolPinsResponse getSymbolPins( API_HANDLER_SCH& aHandler, const SCHEMATIC& aSchematic,
+                                                              const std::vector<KIID>& aSymbols )
+{
+    kiapi::schematic::commands::GetSymbolPins command;
+    *command.mutable_document() = makeDocument( aSchematic );
+
+    for( const KIID& id : aSymbols )
+        command.add_symbols()->set_value( id.AsStdString() );
+
+    kiapi::common::ApiRequest request;
+    request.mutable_header()->set_client_name( "kicad.qa" );
+    BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+
+    API_RESULT result = aHandler.Handle( request );
+    BOOST_REQUIRE( result.has_value() );
+    BOOST_REQUIRE_EQUAL( result->status().status(), kiapi::common::ApiStatusCode::AS_OK );
+
+    kiapi::schematic::commands::SymbolPinsResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+    return response;
+}
+
+
+SCH_SYMBOL* firstMultiPinSymbol( SCHEMATIC& aSchematic, SCH_SHEET_PATH& aPath )
+{
+    for( const SCH_SHEET_PATH& path : aSchematic.Hierarchy() )
+    {
+        for( SCH_ITEM* item : path.LastScreen()->Items().OfType( SCH_SYMBOL_T ) )
+        {
+            SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+
+            if( symbol->GetPins( &path ).size() >= 2 && !symbol->IsPower() )
+            {
+                aPath = path;
+                return symbol;
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+} // namespace
+
+
+BOOST_AUTO_TEST_CASE( GetSymbolPinsReportsSheetPositions )
+{
+    SCHEMATIC* model = loadSchematic( wxS( "api_kitchen_sink" ) );
+
+    API_HANDLER_SCH handler( m_context );
+    auto            response = getSymbolPins( handler, *model, {} );
+
+    size_t expectedSymbols = 0;
+
+    for( const SCH_SHEET_PATH& path : model->Hierarchy() )
+    {
+        for( SCH_ITEM* item : path.LastScreen()->Items().OfType( SCH_SYMBOL_T ) )
+        {
+            wxUnusedVar( item );
+            expectedSymbols++;
+        }
+    }
+
+    BOOST_CHECK_EQUAL( static_cast<size_t>( response.symbols_size() ), expectedSymbols );
+
+    for( const kiapi::schematic::commands::SymbolPins& entry : response.symbols() )
+    {
+        auto* symbol = dynamic_cast<SCH_SYMBOL*>( model->ResolveItem( KIID( entry.symbol().value() ) ) );
+        BOOST_REQUIRE( symbol );
+
+        SCH_SHEET_PATH path;
+        model->ResolveItem( symbol->m_Uuid, &path );
+
+        for( const kiapi::schematic::commands::PlacedSymbolPin& info : entry.pins() )
+        {
+            SCH_PIN* pin = nullptr;
+
+            for( SCH_PIN* candidate : symbol->GetPins( &path ) )
+            {
+                if( candidate->m_Uuid.AsStdString() == info.id().value() )
+                    pin = candidate;
+            }
+
+            BOOST_REQUIRE( pin );
+            BOOST_CHECK( kiapi::common::UnpackVector2( info.position(), schIUScale ) == pin->GetPosition() );
+            BOOST_CHECK_EQUAL( info.number(), pin->GetNumber().ToStdString() );
+        }
+    }
+}
+
+
+BOOST_AUTO_TEST_CASE( GetSymbolPinsFollowsRotation )
+{
+    SCHEMATIC*     model = loadSchematic( wxS( "api_kitchen_sink" ) );
+    SCH_SHEET_PATH path;
+    SCH_SYMBOL*    symbol = firstMultiPinSymbol( *model, path );
+    BOOST_REQUIRE( symbol );
+
+    symbol->SetOrientation( SYM_ORIENT_0 );
+
+    API_HANDLER_SCH handler( m_context );
+    auto            before = getSymbolPins( handler, *model, { symbol->m_Uuid } );
+
+    symbol->SetOrientation( SYM_ORIENT_90 );
+    auto after = getSymbolPins( handler, *model, { symbol->m_Uuid } );
+
+    BOOST_REQUIRE_EQUAL( before.symbols_size(), 1 );
+    BOOST_REQUIRE_EQUAL( after.symbols_size(), 1 );
+    BOOST_REQUIRE_EQUAL( before.symbols( 0 ).pins_size(), after.symbols( 0 ).pins_size() );
+
+    const VECTOR2I anchor = symbol->GetPosition();
+
+    // Rotating 90 degrees counter-clockwise on a Y-down sheet maps an offset (x, y) to (y, -x)
+    for( int i = 0; i < before.symbols( 0 ).pins_size(); ++i )
+    {
+        VECTOR2I p0 = kiapi::common::UnpackVector2( before.symbols( 0 ).pins( i ).position(), schIUScale ) - anchor;
+        VECTOR2I p1 = kiapi::common::UnpackVector2( after.symbols( 0 ).pins( i ).position(), schIUScale ) - anchor;
+
+        BOOST_CHECK_EQUAL( p1.x, p0.y );
+        BOOST_CHECK_EQUAL( p1.y, -p0.x );
+    }
+}
+
+
+BOOST_AUTO_TEST_CASE( AnnotateSchematicNumbersUnannotatedSymbols )
+{
+    SCHEMATIC* model = loadSchematic( wxS( "api_kitchen_sink" ) );
+
+    // Clear every non-power reference so the handler has to number all of them
+    std::map<wxString, int> expectedPerPrefix;
+
+    for( const SCH_SHEET_PATH& path : model->Hierarchy() )
+    {
+        for( SCH_ITEM* item : path.LastScreen()->Items().OfType( SCH_SYMBOL_T ) )
+        {
+            SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+
+            if( symbol->IsPower() )
+                continue;
+
+            wxString prefix = symbol->GetPrefix();
+            symbol->SetRef( &path, prefix + wxS( "?" ) );
+            expectedPerPrefix[prefix]++;
+        }
+    }
+
+    BOOST_REQUIRE( !expectedPerPrefix.empty() );
+
+    kiapi::schematic::commands::AnnotateSchematic command;
+    *command.mutable_document() = makeDocument( *model );
+    command.set_scope( kiapi::schematic::commands::ANS_ALL );
+    command.set_start_number( 1 );
+
+    kiapi::common::ApiRequest request;
+    request.mutable_header()->set_client_name( "kicad.qa" );
+    BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+
+    API_HANDLER_SCH handler( m_context );
+    API_RESULT      result = handler.Handle( request );
+
+    BOOST_REQUIRE( result.has_value() );
+    BOOST_REQUIRE_EQUAL( result->status().status(), kiapi::common::ApiStatusCode::AS_OK );
+
+    kiapi::schematic::commands::AnnotateSchematicResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+
+    int expectedChanges = 0;
+
+    for( const auto& [prefix, count] : expectedPerPrefix )
+        expectedChanges += count;
+
+    BOOST_CHECK_GE( response.changes_size(), 1 );
+
+    // Every symbol now has a numbered, unique reference and numbering starts at 1 per prefix
+    std::set<wxString> refs;
+    std::map<wxString, int> lowest;
+
+    for( const SCH_SHEET_PATH& path : model->Hierarchy() )
+    {
+        for( SCH_ITEM* item : path.LastScreen()->Items().OfType( SCH_SYMBOL_T ) )
+        {
+            SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+
+            if( symbol->IsPower() )
+                continue;
+
+            wxString ref = symbol->GetRef( &path, false );
+            BOOST_CHECK_MESSAGE( !ref.EndsWith( wxS( "?" ) ), "unannotated: " << ref );
+
+            if( symbol->GetUnitCount() == 1 )
+                BOOST_CHECK_MESSAGE( refs.insert( ref ).second, "duplicate reference " << ref );
+
+            long number = 0;
+            ref.Mid( symbol->GetPrefix().length() ).ToLong( &number );
+
+            auto it = lowest.find( symbol->GetPrefix() );
+            lowest[symbol->GetPrefix()] = it == lowest.end() ? number : std::min<long>( it->second, number );
+        }
+    }
+
+    for( const auto& [prefix, number] : lowest )
+        BOOST_CHECK_MESSAGE( number == 1, prefix << " numbering starts at " << number );
+
+    BOOST_CHECK_LE( response.changes_size(), expectedChanges );
+}
+
 
 BOOST_AUTO_TEST_SUITE_END()

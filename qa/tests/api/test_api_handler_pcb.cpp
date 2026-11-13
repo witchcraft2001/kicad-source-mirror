@@ -28,11 +28,16 @@
 #include <pcbnew_utils/board_test_utils.h>
 
 #include <board.h>
+#include <board_connected_item.h>
+#include <connectivity/connectivity_algo.h>
 #include <connectivity/connectivity_data.h>
+#include <drc/drc_engine.h>
 #include <drc/drc_exclusion.h>
 #include <drc/drc_item.h>
 #include <drc/drc_rule.h>
+#include <pad.h>
 #include <pcb_marker.h>
+#include <pcb_track.h>
 #include <settings/settings_manager.h>
 #include <zone.h>
 #include <zone_filler.h>
@@ -43,6 +48,7 @@
 #include <api/board/board_commands.pb.h>
 #include <api/board/board_rules.pb.h>
 #include <api/board/board_tasks.pb.h>
+#include <api/board/board_types.pb.h>
 #include <api/common/commands/editor_commands.pb.h>
 #include <api/common/envelope.pb.h>
 #include <api/common/tasks.pb.h>
@@ -192,6 +198,61 @@ kiapi::common::ApiRequest makeGetDrcTaskResultRequest( const std::string& aToken
 {
     kiapi::board::tasks::GetDrcTaskResult command;
     command.mutable_token()->set_value( aToken );
+
+    kiapi::common::ApiRequest request;
+    request.mutable_header()->set_client_name( "kicad.qa" );
+    BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+
+    return request;
+}
+
+kiapi::common::ApiRequest makeUnroutedRequest( BOARD* aBoard, const std::vector<std::string>& aNets )
+{
+    kiapi::board::commands::GetUnroutedConnections command;
+    command.mutable_board()->set_type( kiapi::common::types::DocumentType::DOCTYPE_PCB );
+    command.mutable_board()->set_board_filename( wxFileName( aBoard->GetFileName() ).GetFullName().ToStdString() );
+
+    for( const std::string& net : aNets )
+        command.add_nets()->set_name( net );
+
+    kiapi::common::ApiRequest request;
+    request.mutable_header()->set_client_name( "kicad.qa" );
+    BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+
+    return request;
+}
+
+kiapi::common::ApiRequest makeNetLengthsRequest( BOARD* aBoard, const std::vector<std::string>& aNets,
+                                                 bool aDelay )
+{
+    kiapi::board::commands::GetNetLengths command;
+    command.mutable_board()->set_type( kiapi::common::types::DocumentType::DOCTYPE_PCB );
+    command.mutable_board()->set_board_filename( wxFileName( aBoard->GetFileName() ).GetFullName().ToStdString() );
+    command.set_include_delay( aDelay );
+
+    for( const std::string& net : aNets )
+        command.add_nets()->set_name( net );
+
+    kiapi::common::ApiRequest request;
+    request.mutable_header()->set_client_name( "kicad.qa" );
+    BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+
+    return request;
+}
+
+kiapi::common::ApiRequest makeQueryConstraintRequest( BOARD* aBoard, kiapi::board::CustomRuleConstraintType aType,
+                                                      const KIID& aItemA, const KIID* aItemB )
+{
+    kiapi::board::commands::QueryConstraint command;
+    command.mutable_board()->set_type( kiapi::common::types::DocumentType::DOCTYPE_PCB );
+    command.mutable_board()->set_board_filename( wxFileName( aBoard->GetFileName() ).GetFullName().ToStdString() );
+    command.set_constraint( aType );
+    command.mutable_item_a()->set_value( aItemA.AsStdString() );
+
+    if( aItemB )
+        command.mutable_item_b()->set_value( aItemB->AsStdString() );
+
+    command.set_include_report( true );
 
     kiapi::common::ApiRequest request;
     request.mutable_header()->set_client_name( "kicad.qa" );
@@ -814,6 +875,406 @@ BOOST_AUTO_TEST_CASE( DrcExclusionDropsMarkerReportFields )
     BOOST_CHECK( roundTrippedMsg.violating_rule().empty() );
     BOOST_CHECK( roundTrippedMsg.description().empty() );
     BOOST_CHECK( !roundTrippedMsg.excluded() );
+}
+
+
+BOOST_AUTO_TEST_CASE( GetUnroutedConnectionsMatchesRatsnest )
+{
+    BOARD* board = loadBoard( wxS( "issue5830" ) );
+
+    // With the planes empty the GND pads ratsnest together, so there is work left to route
+    unfillAll( board );
+    board->BuildConnectivity();
+    const unsigned expected = board->GetConnectivity()->GetUnconnectedCount( false );
+    BOOST_REQUIRE( expected > 0 );
+
+    API_HANDLER_PCB handler( m_context );
+    kiapi::common::ApiRequest request = makeUnroutedRequest( board, {} );
+    API_RESULT                result = handler.Handle( request );
+
+    BOOST_REQUIRE( result.has_value() );
+    BOOST_REQUIRE_EQUAL( result->status().status(), kiapi::common::ApiStatusCode::AS_OK );
+
+    kiapi::board::commands::UnroutedConnectionsResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+    BOOST_CHECK_EQUAL( static_cast<unsigned>( response.connections_size() ), expected );
+
+    for( const kiapi::board::commands::UnroutedConnection& connection : response.connections() )
+    {
+        auto* fromItem = dynamic_cast<BOARD_CONNECTED_ITEM*>(
+                board->ResolveItem( KIID( connection.from_item().value() ), true ) );
+        auto* toItem = dynamic_cast<BOARD_CONNECTED_ITEM*>(
+                board->ResolveItem( KIID( connection.to_item().value() ), true ) );
+
+        BOOST_REQUIRE( fromItem );
+        BOOST_REQUIRE( toItem );
+
+        // Both ends belong to the reported net
+        BOOST_CHECK_EQUAL( fromItem->GetNetname().ToStdString(), connection.net().name() );
+        BOOST_CHECK_EQUAL( toItem->GetNetname().ToStdString(), connection.net().name() );
+
+        VECTOR2I delta( connection.to_position().x_nm() - connection.from_position().x_nm(),
+                        connection.to_position().y_nm() - connection.from_position().y_nm() );
+        BOOST_CHECK_CLOSE( static_cast<double>( connection.length().value_nm() ), delta.EuclideanNorm(), 0.01 );
+    }
+}
+
+
+BOOST_AUTO_TEST_CASE( GetUnroutedConnectionsFiltersByNet )
+{
+    BOARD* board = loadBoard( wxS( "issue5830" ) );
+
+    unfillAll( board );
+    board->BuildConnectivity();
+
+    API_HANDLER_PCB handler( m_context );
+    kiapi::common::ApiRequest allRequest = makeUnroutedRequest( board, {} );
+    API_RESULT                all = handler.Handle( allRequest );
+    BOOST_REQUIRE( all.has_value() );
+
+    kiapi::board::commands::UnroutedConnectionsResponse allResponse;
+    BOOST_REQUIRE( all->message().UnpackTo( &allResponse ) );
+    BOOST_REQUIRE( allResponse.connections_size() > 0 );
+
+    const std::string net = allResponse.connections( 0 ).net().name();
+    int expected = 0;
+
+    for( const kiapi::board::commands::UnroutedConnection& connection : allResponse.connections() )
+        expected += connection.net().name() == net ? 1 : 0;
+
+    kiapi::common::ApiRequest filteredRequest = makeUnroutedRequest( board, { net } );
+    API_RESULT                filtered = handler.Handle( filteredRequest );
+    BOOST_REQUIRE( filtered.has_value() );
+
+    kiapi::board::commands::UnroutedConnectionsResponse filteredResponse;
+    BOOST_REQUIRE( filtered->message().UnpackTo( &filteredResponse ) );
+    BOOST_CHECK_EQUAL( filteredResponse.connections_size(), expected );
+
+    for( const kiapi::board::commands::UnroutedConnection& connection : filteredResponse.connections() )
+        BOOST_CHECK_EQUAL( connection.net().name(), net );
+}
+
+
+BOOST_AUTO_TEST_CASE( GetUnroutedConnectionsRejectsUnknownNet )
+{
+    BOARD* board = loadBoard( wxS( "issue5830" ) );
+
+    API_HANDLER_PCB handler( m_context );
+    kiapi::common::ApiRequest request = makeUnroutedRequest( board, { "NO_SUCH_NET" } );
+    API_RESULT                result = handler.Handle( request );
+
+    BOOST_REQUIRE( !result.has_value() );
+    BOOST_CHECK_EQUAL( result.error().status(), kiapi::common::ApiStatusCode::AS_BAD_REQUEST );
+}
+
+
+BOOST_AUTO_TEST_CASE( GetNetLengthsIsConsistentWithBoard )
+{
+    BOARD* board = loadBoard( wxS( "length_calculations" ) );
+
+    API_HANDLER_PCB           handler( m_context );
+    kiapi::common::ApiRequest request = makeNetLengthsRequest( board, {}, true );
+    API_RESULT                result = handler.Handle( request );
+
+    BOOST_REQUIRE( result.has_value() );
+    BOOST_REQUIRE_EQUAL( result->status().status(), kiapi::common::ApiStatusCode::AS_OK );
+
+    kiapi::board::commands::NetLengthsResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+    BOOST_REQUIRE( response.nets_size() > 0 );
+
+    bool sawRouted = false;
+
+    for( const kiapi::board::commands::NetLength& net : response.nets() )
+    {
+        NETINFO_ITEM* info = board->FindNet( wxString::FromUTF8( net.net().name() ) );
+        BOOST_REQUIRE( info );
+
+        int vias = 0;
+
+        for( PCB_TRACK* track : board->Tracks() )
+        {
+            if( track->Type() == PCB_VIA_T && track->GetNetCode() == info->GetNetCode() )
+                vias++;
+        }
+
+        BOOST_CHECK_EQUAL( net.via_count(), vias );
+
+        int64_t layerSum = 0;
+
+        for( const kiapi::board::commands::NetLayerLength& layer : net.layers() )
+            layerSum += layer.length().value_nm();
+
+        BOOST_CHECK_EQUAL( layerSum, net.track_length().value_nm() );
+        BOOST_CHECK_EQUAL( net.total_length().value_nm(), net.track_length().value_nm() + net.via_length().value_nm()
+                                                                  + net.pad_to_die_length().value_nm() );
+
+        if( net.track_length().value_nm() > 0 )
+            sawRouted = true;
+    }
+
+    BOOST_CHECK( sawRouted );
+}
+
+
+BOOST_AUTO_TEST_CASE( GetNetLengthsReportsDelayWithTuningProfiles )
+{
+    // time_calculations assigns tuning profiles, so routed nets have a propagation delay
+    BOARD* board = loadBoard( wxS( "time_calculations" ) );
+
+    API_HANDLER_PCB           handler( m_context );
+    kiapi::common::ApiRequest request = makeNetLengthsRequest( board, {}, true );
+    API_RESULT                result = handler.Handle( request );
+    BOOST_REQUIRE( result.has_value() );
+
+    kiapi::board::commands::NetLengthsResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+
+    int withDelay = 0;
+
+    for( const kiapi::board::commands::NetLength& net : response.nets() )
+    {
+        if( net.track_length().value_nm() > 0 && net.total_delay().value_as() > 0 )
+            withDelay++;
+    }
+
+    BOOST_CHECK( withDelay > 0 );
+
+    // Without the flag no delay is computed
+    kiapi::common::ApiRequest noDelay = makeNetLengthsRequest( board, {}, false );
+    API_RESULT                noDelayResult = handler.Handle( noDelay );
+    BOOST_REQUIRE( noDelayResult.has_value() );
+
+    kiapi::board::commands::NetLengthsResponse noDelayResponse;
+    BOOST_REQUIRE( noDelayResult->message().UnpackTo( &noDelayResponse ) );
+
+    for( const kiapi::board::commands::NetLength& net : noDelayResponse.nets() )
+        BOOST_CHECK_EQUAL( net.total_delay().value_as(), 0 );
+}
+
+
+BOOST_AUTO_TEST_CASE( GetNetLengthsFiltersAndRejects )
+{
+    BOARD* board = loadBoard( wxS( "length_calculations" ) );
+
+    API_HANDLER_PCB           handler( m_context );
+    kiapi::common::ApiRequest all = makeNetLengthsRequest( board, {}, false );
+    API_RESULT                allResult = handler.Handle( all );
+    BOOST_REQUIRE( allResult.has_value() );
+
+    kiapi::board::commands::NetLengthsResponse allResponse;
+    BOOST_REQUIRE( allResult->message().UnpackTo( &allResponse ) );
+    BOOST_REQUIRE( allResponse.nets_size() > 0 );
+
+    const kiapi::board::commands::NetLength& first = allResponse.nets( 0 );
+
+    kiapi::common::ApiRequest one = makeNetLengthsRequest( board, { first.net().name() }, false );
+    API_RESULT                oneResult = handler.Handle( one );
+    BOOST_REQUIRE( oneResult.has_value() );
+
+    kiapi::board::commands::NetLengthsResponse oneResponse;
+    BOOST_REQUIRE( oneResult->message().UnpackTo( &oneResponse ) );
+    BOOST_REQUIRE_EQUAL( oneResponse.nets_size(), 1 );
+    BOOST_CHECK_EQUAL( oneResponse.nets( 0 ).total_length().value_nm(), first.total_length().value_nm() );
+
+    kiapi::common::ApiRequest bad = makeNetLengthsRequest( board, { "NO_SUCH_NET" }, false );
+    API_RESULT                badResult = handler.Handle( bad );
+    BOOST_REQUIRE( !badResult.has_value() );
+    BOOST_CHECK_EQUAL( badResult.error().status(), kiapi::common::ApiStatusCode::AS_BAD_REQUEST );
+}
+
+
+BOOST_AUTO_TEST_CASE( QueryConstraintResolvesCustomRule )
+{
+    // The board's .kicad_dru limits uncoupled length of every diff pair to 5 mm
+    BOARD* board = loadBoard( wxS( "diff_pair_uncoupled_tuning_drc" ) );
+
+    PCB_TRACK* pairTrack = nullptr;
+
+    for( PCB_TRACK* track : board->Tracks() )
+    {
+        wxString complement, base;
+
+        if( track->Type() == PCB_TRACE_T
+            && DRC_ENGINE::MatchDpSuffix( track->GetNetname(), complement, base ) != 0 )
+        {
+            pairTrack = track;
+            break;
+        }
+    }
+
+    BOOST_REQUIRE( pairTrack );
+
+    API_HANDLER_PCB           handler( m_context );
+    kiapi::common::ApiRequest request = makeQueryConstraintRequest(
+            board, kiapi::board::CustomRuleConstraintType::CRCT_MAX_UNCOUPLED, pairTrack->m_Uuid, nullptr );
+    API_RESULT                result = handler.Handle( request );
+
+    BOOST_REQUIRE( result.has_value() );
+    BOOST_REQUIRE_EQUAL( result->status().status(), kiapi::common::ApiStatusCode::AS_OK );
+
+    kiapi::board::commands::QueryConstraintResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+
+    BOOST_CHECK_MESSAGE( response.found(), response.report() );
+    BOOST_REQUIRE( response.has_max() );
+    BOOST_CHECK_EQUAL( response.max(), pcbIUScale.mmToIU( 5.0 ) );
+    BOOST_CHECK_MESSAGE( response.source().find( "DP uncoupled" ) != std::string::npos, response.source() );
+    BOOST_CHECK( !response.report().empty() );
+}
+
+
+BOOST_AUTO_TEST_CASE( QueryConstraintClearanceBetweenItems )
+{
+    BOARD* board = loadBoard( wxS( "issue5830" ) );
+
+    // Two copper items on different nets
+    BOARD_CONNECTED_ITEM* a = nullptr;
+    BOARD_CONNECTED_ITEM* b = nullptr;
+
+    for( PAD* pad : board->GetPads() )
+    {
+        if( pad->GetNetCode() <= 0 )
+            continue;
+
+        if( !a )
+            a = pad;
+        else if( pad->GetNetCode() != a->GetNetCode() )
+        {
+            b = pad;
+            break;
+        }
+    }
+
+    BOOST_REQUIRE( a && b );
+
+    API_HANDLER_PCB           handler( m_context );
+    kiapi::common::ApiRequest request = makeQueryConstraintRequest(
+            board, kiapi::board::CustomRuleConstraintType::CRCT_CLEARANCE, a->m_Uuid, &b->m_Uuid );
+    API_RESULT                result = handler.Handle( request );
+
+    BOOST_REQUIRE( result.has_value() );
+
+    kiapi::board::commands::QueryConstraintResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+    BOOST_CHECK( response.found() );
+    BOOST_REQUIRE( response.has_min() );
+    BOOST_CHECK( response.min() > 0 );
+}
+
+
+BOOST_AUTO_TEST_CASE( QueryConstraintRejectsUnknownItem )
+{
+    BOARD* board = loadBoard( wxS( "issue5830" ) );
+
+    API_HANDLER_PCB           handler( m_context );
+    KIID                      missing;
+    kiapi::common::ApiRequest request = makeQueryConstraintRequest(
+            board, kiapi::board::CustomRuleConstraintType::CRCT_TRACK_WIDTH, missing, nullptr );
+    API_RESULT                result = handler.Handle( request );
+
+    BOOST_REQUIRE( !result.has_value() );
+    BOOST_CHECK_EQUAL( result.error().status(), kiapi::common::ApiStatusCode::AS_BAD_REQUEST );
+}
+
+
+BOOST_AUTO_TEST_CASE( RouteConnectionRoutesRatsnestLine )
+{
+    BOARD* board = loadBoard( wxS( "issue5830" ) );
+
+    // With the planes empty, GND pads ratsnest together: route one of those lines
+    unfillAll( board );
+    board->BuildConnectivity();
+
+    std::shared_ptr<CONNECTIVITY_DATA> connectivity = board->GetConnectivity();
+    const unsigned                     before = connectivity->GetUnconnectedCount( false );
+    BOOST_REQUIRE( before > 0 );
+
+    PAD* from = nullptr;
+    PAD* to = nullptr;
+
+    connectivity->RunOnUnconnectedEdges(
+            [&]( CN_EDGE& aEdge )
+            {
+                auto* a = dynamic_cast<PAD*>( aEdge.GetSourceNode()->Parent() );
+                auto* b = dynamic_cast<PAD*>( aEdge.GetTargetNode()->Parent() );
+
+                if( a && b && a->IsOnLayer( F_Cu ) && b->IsOnLayer( F_Cu ) )
+                {
+                    from = a;
+                    to = b;
+                    return false;
+                }
+
+                return true;
+            } );
+
+    BOOST_REQUIRE( from && to );
+
+    kiapi::board::commands::RouteConnection command;
+    command.mutable_board()->set_type( kiapi::common::types::DocumentType::DOCTYPE_PCB );
+    command.mutable_board()->set_board_filename( wxFileName( board->GetFileName() ).GetFullName().ToStdString() );
+    command.mutable_start_item()->set_value( from->m_Uuid.AsStdString() );
+    command.mutable_end_item()->set_value( to->m_Uuid.AsStdString() );
+    command.set_layer( kiapi::board::types::BoardLayer::BL_F_Cu );
+    command.set_mode( kiapi::board::commands::RouterMode::RTM_SINGLE );
+    command.set_collision_mode( kiapi::board::commands::RouterCollisionMode::RCM_MARK_OBSTACLES );
+
+    kiapi::common::ApiRequest request;
+    request.mutable_header()->set_client_name( "kicad.qa" );
+    BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+
+    const size_t tracksBefore = board->Tracks().size();
+
+    API_HANDLER_PCB handler( m_context );
+    API_RESULT      result = handler.Handle( request );
+
+    BOOST_REQUIRE( result.has_value() );
+    BOOST_REQUIRE_EQUAL( result->status().status(), kiapi::common::ApiStatusCode::AS_OK );
+
+    kiapi::board::commands::RouteConnectionResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+
+    BOOST_REQUIRE_MESSAGE( response.success(), response.failure_reason() );
+    BOOST_CHECK( response.created_items_size() > 0 );
+    BOOST_CHECK_EQUAL( board->Tracks().size(), tracksBefore + response.created_items_size() );
+
+    // Every new track is on the requested layer and the start pad's net
+    for( const google::protobuf::Any& any : response.created_items() )
+    {
+        kiapi::board::types::Track track;
+
+        if( !any.UnpackTo( &track ) )
+            continue;
+
+        BOOST_CHECK_EQUAL( track.layer(), kiapi::board::types::BoardLayer::BL_F_Cu );
+        BOOST_CHECK_EQUAL( track.net().name(), from->GetNetname().ToStdString() );
+    }
+
+    connectivity->RecalculateRatsnest();
+    BOOST_CHECK_LT( connectivity->GetUnconnectedCount( false ), before );
+}
+
+
+BOOST_AUTO_TEST_CASE( RouteConnectionRejectsNonCopperItems )
+{
+    BOARD* board = loadBoard( wxS( "issue5830" ) );
+
+    kiapi::board::commands::RouteConnection command;
+    command.mutable_board()->set_type( kiapi::common::types::DocumentType::DOCTYPE_PCB );
+    command.mutable_board()->set_board_filename( wxFileName( board->GetFileName() ).GetFullName().ToStdString() );
+    command.mutable_start_item()->set_value( KIID().AsStdString() );
+    command.mutable_end_item()->set_value( KIID().AsStdString() );
+
+    kiapi::common::ApiRequest request;
+    request.mutable_header()->set_client_name( "kicad.qa" );
+    BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+
+    API_HANDLER_PCB handler( m_context );
+    API_RESULT      result = handler.Handle( request );
+
+    BOOST_REQUIRE( !result.has_value() );
+    BOOST_CHECK_EQUAL( result.error().status(), kiapi::common::ApiStatusCode::AS_BAD_REQUEST );
 }
 
 

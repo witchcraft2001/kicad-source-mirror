@@ -122,6 +122,17 @@ private:
     HANDLER_RESULT<NetClassForNetsResponse> handleGetNetClassForNets(
             const HANDLER_CONTEXT<GetNetClassForNets>& aCtx );
 
+    HANDLER_RESULT<UnroutedConnectionsResponse> handleGetUnroutedConnections(
+            const HANDLER_CONTEXT<GetUnroutedConnections>& aCtx );
+
+    HANDLER_RESULT<NetLengthsResponse> handleGetNetLengths( const HANDLER_CONTEXT<GetNetLengths>& aCtx );
+
+    HANDLER_RESULT<QueryConstraintResponse> handleQueryConstraint(
+            const HANDLER_CONTEXT<QueryConstraint>& aCtx );
+
+    HANDLER_RESULT<RouteConnectionResponse> handleRouteConnection(
+            const HANDLER_CONTEXT<RouteConnection>& aCtx );
+
     HANDLER_RESULT<Empty> handleRefillZones( const HANDLER_CONTEXT<RefillZones>& aCtx );
 
     HANDLER_RESULT<ImportNetlistResponse> handleImportNetlist(

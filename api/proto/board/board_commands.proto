@@ -290,6 +290,213 @@ message NetClassForNetsResponse
   map<string, kiapi.common.project.NetClass> classes = 1;
 }
 
+// Retrieves the connections that still need to be routed (the ratsnest).  Each entry is one
+// ratsnest line between two connected items of the same net that are not yet joined by copper.
+// Returns UnroutedConnectionsResponse
+// Since: 11.0
+message GetUnroutedConnections
+{
+  kiapi.common.types.DocumentSpecifier board = 1;
+
+  // Optional list of nets to report.  If empty, all nets are reported.
+  repeated kiapi.board.types.Net nets = 2;
+}
+
+// Since: 11.0
+message UnroutedConnection
+{
+  kiapi.board.types.Net net = 1;
+
+  // The item at each end of the ratsnest line (usually a pad, track, via or zone)
+  kiapi.common.types.KIID from_item = 2;
+  kiapi.common.types.Vector2 from_position = 3;
+  kiapi.common.types.KIID to_item = 4;
+  kiapi.common.types.Vector2 to_position = 5;
+
+  // Straight-line distance between the two ends
+  kiapi.common.types.Distance length = 6;
+
+  // False if the line is hidden in the editor (for example because its net is hidden)
+  bool visible = 7;
+}
+
+// Since: 11.0
+message UnroutedConnectionsResponse
+{
+  repeated UnroutedConnection connections = 1;
+}
+
+// Retrieves routed lengths and propagation delays of nets, computed the same way as the Net
+// Inspector and the length-tuning DRC checks (via and pad-to-die lengths included).
+// Returns NetLengthsResponse
+// Since: 11.0
+message GetNetLengths
+{
+  kiapi.common.types.DocumentSpecifier board = 1;
+
+  // Nets to report.  If empty, every net with at least one pad is reported.
+  repeated kiapi.board.types.Net nets = 2;
+
+  // Also compute propagation delays (uses the tuning profiles of the nets' netclasses)
+  bool include_delay = 3;
+}
+
+// Since: 11.0
+message NetLayerLength
+{
+  kiapi.board.types.BoardLayer layer = 1;
+  kiapi.common.types.Distance length = 2;
+  kiapi.common.types.Time delay = 3;
+}
+
+// Since: 11.0
+message NetLength
+{
+  kiapi.board.types.Net net = 1;
+
+  kiapi.common.types.Distance track_length = 2;
+  kiapi.common.types.Distance via_length = 3;
+  kiapi.common.types.Distance pad_to_die_length = 4;
+
+  // Sum of track, via and pad-to-die length
+  kiapi.common.types.Distance total_length = 5;
+
+  // Delays are zero unless include_delay was set
+  kiapi.common.types.Time track_delay = 6;
+  kiapi.common.types.Time via_delay = 7;
+  kiapi.common.types.Time pad_to_die_delay = 8;
+  kiapi.common.types.Time total_delay = 9;
+
+  int32 pad_count = 10;
+  int32 via_count = 11;
+
+  // Track length per copper layer
+  repeated NetLayerLength layers = 12;
+
+  // Sum of the ratsnest lines still to route on this net
+  kiapi.common.types.Distance unrouted_length = 13;
+}
+
+// Since: 11.0
+message NetLengthsResponse
+{
+  repeated NetLength nets = 1;
+}
+
+// Resolves the design-rule constraint that applies to one item, or between two items, on a layer
+// (as the "Constraints Resolution" inspector does), including which rule produced it.
+// Returns QueryConstraintResponse
+// Since: 11.0
+message QueryConstraint
+{
+  kiapi.common.types.DocumentSpecifier board = 1;
+
+  // The constraint to resolve, e.g. CRCT_CLEARANCE, CRCT_TRACK_WIDTH, CRCT_DIFF_PAIR_GAP,
+  // CRCT_LENGTH, CRCT_SKEW, CRCT_VIA_DIAMETER, CRCT_HOLE_SIZE
+  kiapi.board.CustomRuleConstraintType constraint = 2;
+
+  kiapi.common.types.KIID item_a = 3;
+
+  // Required for two-item constraints such as clearance; otherwise leave unset
+  optional kiapi.common.types.KIID item_b = 4;
+
+  // Layer to evaluate on; defaults to the first copper layer item_a exists on
+  optional kiapi.board.types.BoardLayer layer = 5;
+
+  // Also return the human-readable rule resolution trace
+  bool include_report = 6;
+}
+
+// Since: 11.0
+message QueryConstraintResponse
+{
+  // False if no rule defines this constraint for the items
+  bool found = 1;
+
+  // Values in nanometres (or attoseconds for time-domain length/skew constraints)
+  optional int64 min = 2;
+  optional int64 opt = 3;
+  optional int64 max = 4;
+
+  // Name of the rule or netclass that set the value, e.g. "netclass 'Default'"
+  string source = 5;
+
+  kiapi.common.types.RuleSeverity severity = 6;
+
+  // Rule resolution trace when include_report was set
+  string report = 7;
+}
+
+// Since: 11.0
+enum RouterMode
+{
+  RTM_UNKNOWN = 0;
+  RTM_SINGLE = 1;     // a single track
+  RTM_DIFF_PAIR = 2;  // both nets of a differential pair, starting from either of them
+}
+
+// How the router treats obstacles (Router Settings > Mode)
+// Since: 11.0
+enum RouterCollisionMode
+{
+  RCM_UNKNOWN = 0;
+  RCM_WALKAROUND = 1;       // route around existing items (default)
+  RCM_SHOVE = 2;            // push existing tracks and vias aside
+  RCM_MARK_OBSTACLES = 3;   // allow collisions; they are reported by DRC
+}
+
+// Routes a connection with the interactive push-and-shove router, as if a user started at
+// start_item, clicked each waypoint and finished on end_item.  Clearances, widths and
+// differential-pair gaps come from the design rules unless overridden.  The routed items are
+// committed as one undoable change.
+// Returns RouteConnectionResponse
+// Since: 11.0
+message RouteConnection
+{
+  kiapi.common.types.DocumentSpecifier board = 1;
+
+  // Pad, via or track to start from
+  kiapi.common.types.KIID start_item = 2;
+
+  // Start point; defaults to the start item's position (required when starting from a track)
+  optional kiapi.common.types.Vector2 start_position = 3;
+
+  // Pad, via or track to finish on
+  kiapi.common.types.KIID end_item = 4;
+
+  // End point; defaults to the end item's position
+  optional kiapi.common.types.Vector2 end_position = 5;
+
+  // Intermediate points the route must pass through, in order
+  repeated kiapi.common.types.Vector2 waypoints = 6;
+
+  // Copper layer to route on; defaults to the start item's first copper layer
+  optional kiapi.board.types.BoardLayer layer = 7;
+
+  RouterMode mode = 8;
+  RouterCollisionMode collision_mode = 9;
+
+  // Overrides for the rule-derived sizes
+  optional kiapi.common.types.Distance track_width = 10;
+  optional kiapi.common.types.Distance diff_pair_gap = 11;
+}
+
+// Since: 11.0
+message RouteConnectionResponse
+{
+  // True if the route reached the end item and was committed
+  bool success = 1;
+
+  // Router message when the route could not be completed
+  string failure_reason = 2;
+
+  // Tracks, arcs and vias the router added
+  repeated google.protobuf.Any created_items = 3;
+
+  // Items the router removed or replaced (for example shoved tracks)
+  repeated kiapi.common.types.KIID removed_items = 4;
+}
+
 /*
  * Netlist import
  */

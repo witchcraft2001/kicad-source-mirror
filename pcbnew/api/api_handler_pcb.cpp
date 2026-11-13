@@ -27,6 +27,7 @@
 #include <common.h>
 #include <fmt.h>
 #include <api/api_handler_pcb.h>
+#include <api/api_pns_iface.h>
 #include <api/api_pcb_utils.h>
 #include <api/api_enums.h>
 #include <api/api_server.h>
@@ -57,6 +58,7 @@
 #include <pcb_3d_body.h>
 #include <pcb_point.h>
 #include <kiway.h>
+#include <drc/drc_engine.h>
 #include <drc/drc_item.h>
 #include <jobs/job_export_pcb_3d.h>
 #include <jobs/job_export_pcb_dxf.h>
@@ -100,7 +102,14 @@
 #include <specctra_import_export/specctra.h>
 #include <reporter.h>
 #include <api/board/board_rules.pb.h>
+#include <bitset>
+#include <connectivity/connectivity_algo.h>
 #include <connectivity/connectivity_data.h>
+#include <length_delay_calculation/length_delay_calculation.h>
+#include <ratsnest/ratsnest_data.h>
+#include <router/pns_router.h>
+#include <router/pns_routing_settings.h>
+#include <router/pns_sizes_settings.h>
 #include <google/protobuf/util/json_util.h>
 #include <drc/drc_rule_condition.h>
 #include <drc/drc_rule_parser.h>
@@ -154,6 +163,11 @@ API_HANDLER_PCB::API_HANDLER_PCB( std::shared_ptr<PCB_CONTEXT> aContext, PCB_EDI
     registerHandler<GetItemsByNetClass, GetItemsResponse>( &API_HANDLER_PCB::handleGetItemsByNetClass );
     registerHandler<GetNetClassForNets, NetClassForNetsResponse>(
             &API_HANDLER_PCB::handleGetNetClassForNets );
+    registerHandler<GetUnroutedConnections, UnroutedConnectionsResponse>(
+            &API_HANDLER_PCB::handleGetUnroutedConnections );
+    registerHandler<GetNetLengths, NetLengthsResponse>( &API_HANDLER_PCB::handleGetNetLengths );
+    registerHandler<QueryConstraint, QueryConstraintResponse>( &API_HANDLER_PCB::handleQueryConstraint );
+    registerHandler<RouteConnection, RouteConnectionResponse>( &API_HANDLER_PCB::handleRouteConnection );
     registerHandler<RefillZones, Empty>( &API_HANDLER_PCB::handleRefillZones );
     registerHandler<ImportNetlist, ImportNetlistResponse>( &API_HANDLER_PCB::handleImportNetlist );
     registerHandler<ImportSpecctraSession, ImportSpecctraSessionResponse>(
@@ -1767,6 +1781,460 @@ HANDLER_RESULT<NetClassForNetsResponse> API_HANDLER_PCB::handleGetNetClassForNet
 
         auto [pair, rc] = response.mutable_classes()->insert( { net.name(), {} } );
         netInfo->GetNetClass()->Serialize( pair->second );
+    }
+
+    return response;
+}
+
+
+HANDLER_RESULT<UnroutedConnectionsResponse> API_HANDLER_PCB::handleGetUnroutedConnections(
+            const HANDLER_CONTEXT<GetUnroutedConnections>& aCtx )
+{
+    if( HANDLER_RESULT<bool> documentValidation = validateDocument( aCtx.Request.board() ); !documentValidation )
+        return tl::unexpected( documentValidation.error() );
+
+    BOARD*              board = this->board();
+    const NETINFO_LIST& nets = board->GetNetInfo();
+    std::set<int>       netFilter;
+
+    for( const board::types::Net& net : aCtx.Request.nets() )
+    {
+        NETINFO_ITEM* netInfo = nets.GetNetItem( wxString::FromUTF8( net.name() ) );
+
+        if( !netInfo )
+        {
+            ApiResponseStatus e;
+            e.set_status( ApiStatusCode::AS_BAD_REQUEST );
+            e.set_error_message( fmt::format( "net {} not found on the board", net.name() ) );
+            return tl::unexpected( e );
+        }
+
+        netFilter.insert( netInfo->GetNetCode() );
+    }
+
+    std::shared_ptr<CONNECTIVITY_DATA> connectivity = board->GetConnectivity();
+
+    // Edits pushed with SKIP_CONNECTIVITY can leave dirty nets behind; make the ratsnest current
+    // before reporting it.
+    connectivity->RecalculateRatsnest();
+
+    UnroutedConnectionsResponse response;
+
+    connectivity->RunOnUnconnectedEdges(
+            [&]( CN_EDGE& aEdge )
+            {
+                std::shared_ptr<const CN_ANCHOR> source = aEdge.GetSourceNode();
+                std::shared_ptr<const CN_ANCHOR> target = aEdge.GetTargetNode();
+
+                if( !source || !target || source->Dirty() || target->Dirty() )
+                    return true;
+
+                BOARD_CONNECTED_ITEM* sourceItem = source->Parent();
+                BOARD_CONNECTED_ITEM* targetItem = target->Parent();
+
+                if( !sourceItem || !targetItem )
+                    return true;
+
+                if( !netFilter.empty() && !netFilter.contains( sourceItem->GetNetCode() ) )
+                    return true;
+
+                UnroutedConnection* connection = response.add_connections();
+                connection->mutable_net()->set_name( sourceItem->GetNetname().ToUTF8() );
+                connection->mutable_net()->mutable_code()->set_value( sourceItem->GetNetCode() );
+                connection->mutable_from_item()->set_value( sourceItem->m_Uuid.AsStdString() );
+                PackVector2( *connection->mutable_from_position(), source->Pos() );
+                connection->mutable_to_item()->set_value( targetItem->m_Uuid.AsStdString() );
+                PackVector2( *connection->mutable_to_position(), target->Pos() );
+                PackDistance( *connection->mutable_length(), static_cast<int>( aEdge.GetLength() ) );
+                connection->set_visible( aEdge.IsVisible() );
+                return true;
+            } );
+
+    return response;
+}
+
+
+HANDLER_RESULT<NetLengthsResponse> API_HANDLER_PCB::handleGetNetLengths( const HANDLER_CONTEXT<GetNetLengths>& aCtx )
+{
+    if( HANDLER_RESULT<bool> documentValidation = validateDocument( aCtx.Request.board() ); !documentValidation )
+        return tl::unexpected( documentValidation.error() );
+
+    BOARD*              board = this->board();
+    const NETINFO_LIST& nets = board->GetNetInfo();
+    std::set<int>       requested;
+
+    for( const board::types::Net& net : aCtx.Request.nets() )
+    {
+        NETINFO_ITEM* netInfo = nets.GetNetItem( wxString::FromUTF8( net.name() ) );
+
+        if( !netInfo )
+        {
+            ApiResponseStatus e;
+            e.set_status( ApiStatusCode::AS_BAD_REQUEST );
+            e.set_error_message( fmt::format( "net {} not found on the board", net.name() ) );
+            return tl::unexpected( e );
+        }
+
+        requested.insert( netInfo->GetNetCode() );
+    }
+
+    std::shared_ptr<CONNECTIVITY_DATA> connectivity = board->GetConnectivity();
+    connectivity->RecalculateRatsnest();
+
+    // Same item selection as the Net Inspector: copper path items, grouped by net
+    LENGTH_DELAY_CALCULATION*                                           calc = board->GetLengthCalculation();
+    std::map<int, std::vector<LENGTH_DELAY_CALCULATION_ITEM>>           netItems;
+    const auto typeBits = std::bitset<MAX_STRUCT_TYPE_ID>().set( PCB_TRACE_T ).set( PCB_ARC_T ).set( PCB_VIA_T )
+                                                            .set( PCB_PAD_T );
+
+    for( CN_ITEM* item : connectivity->GetConnectivityAlgo()->ItemList() )
+    {
+        if( !item->Valid() || !typeBits[item->Parent()->Type()] )
+            continue;
+
+        const int netCode = item->Net();
+
+        if( netCode <= 0 || ( !requested.empty() && !requested.contains( netCode ) ) )
+            continue;
+
+        netItems[netCode].emplace_back( calc->GetLengthCalculationItem( item->Parent() ) );
+    }
+
+    constexpr PATH_OPTIMISATIONS opts = { .OptimiseVias = true,
+                                          .MergeTracks = true,
+                                          .OptimiseTracesInPads = true,
+                                          .InferViaInPad = false };
+
+    const LENGTH_DELAY_DOMAIN_OPT domain = aCtx.Request.include_delay() ? LENGTH_DELAY_DOMAIN_OPT::WITH_DELAY_DETAIL
+                                                                        : LENGTH_DELAY_DOMAIN_OPT::NO_DELAY_DETAIL;
+
+    NetLengthsResponse response;
+
+    auto report =
+            [&]( int aNetCode, std::vector<LENGTH_DELAY_CALCULATION_ITEM>& aItems )
+            {
+                LENGTH_DELAY_STATS stats = calc->CalculateLengthDetails( aItems, opts, nullptr, nullptr,
+                                                                         LENGTH_DELAY_LAYER_OPT::WITH_LAYER_DETAIL,
+                                                                         domain );
+
+                if( requested.empty() && stats.NumPads == 0 )
+                    return;
+
+                NETINFO_ITEM* netInfo = nets.GetNetItem( aNetCode );
+                NetLength*    entry = response.add_nets();
+                entry->mutable_net()->set_name( netInfo->GetNetname().ToUTF8() );
+                entry->mutable_net()->mutable_code()->set_value( aNetCode );
+                entry->mutable_track_length()->set_value_nm( stats.TrackLength );
+                entry->mutable_via_length()->set_value_nm( stats.ViaLength );
+                entry->mutable_pad_to_die_length()->set_value_nm( stats.PadToDieLength );
+                entry->mutable_total_length()->set_value_nm( stats.TotalLength() );
+                entry->mutable_track_delay()->set_value_as( stats.TrackDelay );
+                entry->mutable_via_delay()->set_value_as( stats.ViaDelay );
+                entry->mutable_pad_to_die_delay()->set_value_as( stats.PadToDieDelay );
+                entry->mutable_total_delay()->set_value_as( stats.TotalDelay() );
+                entry->set_pad_count( stats.NumPads );
+                entry->set_via_count( stats.NumVias );
+
+                if( stats.LayerLengths )
+                {
+                    for( const auto& [layer, length] : *stats.LayerLengths )
+                    {
+                        if( length == 0 )
+                            continue;
+
+                        NetLayerLength* layerEntry = entry->add_layers();
+                        layerEntry->set_layer( ToProtoEnum<PCB_LAYER_ID, board::types::BoardLayer>( layer ) );
+                        layerEntry->mutable_length()->set_value_nm( length );
+
+                        if( stats.LayerDelays && stats.LayerDelays->contains( layer ) )
+                            layerEntry->mutable_delay()->set_value_as( stats.LayerDelays->at( layer ) );
+                    }
+                }
+
+                if( RN_NET* rnNet = connectivity->GetRatsnestForNet( aNetCode ) )
+                    entry->mutable_unrouted_length()->set_value_nm( rnNet->GetTotalAirlineLength() );
+            };
+
+    for( auto& [netCode, items] : netItems )
+        report( netCode, items );
+
+    // Requested nets without any copper items still get an (empty) entry
+    for( int netCode : requested )
+    {
+        if( !netItems.contains( netCode ) )
+        {
+            std::vector<LENGTH_DELAY_CALCULATION_ITEM> none;
+            report( netCode, none );
+        }
+    }
+
+    return response;
+}
+
+
+HANDLER_RESULT<QueryConstraintResponse> API_HANDLER_PCB::handleQueryConstraint(
+            const HANDLER_CONTEXT<QueryConstraint>& aCtx )
+{
+    if( HANDLER_RESULT<bool> documentValidation = validateDocument( aCtx.Request.board() ); !documentValidation )
+        return tl::unexpected( documentValidation.error() );
+
+    auto badRequest =
+            []( const std::string& aMessage ) -> tl::unexpected<ApiResponseStatus>
+            {
+                ApiResponseStatus e;
+                e.set_status( ApiStatusCode::AS_BAD_REQUEST );
+                e.set_error_message( aMessage );
+                return tl::unexpected( e );
+            };
+
+    DRC_CONSTRAINT_T type = FromProtoEnum<DRC_CONSTRAINT_T>( aCtx.Request.constraint() );
+
+    if( type == NULL_CONSTRAINT )
+        return badRequest( "a constraint type is required" );
+
+    std::optional<BOARD_ITEM*> itemA = getItemById( KIID( aCtx.Request.item_a().value() ) );
+
+    if( !itemA )
+        return badRequest( fmt::format( "item {} not found", aCtx.Request.item_a().value() ) );
+
+    std::optional<BOARD_ITEM*> itemB;
+
+    if( aCtx.Request.has_item_b() )
+    {
+        itemB = getItemById( KIID( aCtx.Request.item_b().value() ) );
+
+        if( !itemB )
+            return badRequest( fmt::format( "item {} not found", aCtx.Request.item_b().value() ) );
+    }
+
+    PCB_LAYER_ID layer = UNDEFINED_LAYER;
+
+    if( aCtx.Request.has_layer() )
+    {
+        layer = FromProtoEnum<PCB_LAYER_ID, board::types::BoardLayer>( aCtx.Request.layer() );
+    }
+    else
+    {
+        LSET copper = ( *itemA )->GetLayerSet() & LSET::AllCuMask();
+        layer = copper.any() ? copper.Seq().front() : ( *itemA )->GetLayer();
+    }
+
+    std::shared_ptr<DRC_ENGINE> engine = board()->GetDesignSettings().m_DRCEngine;
+
+    if( !engine )
+        return badRequest( "the board has no design rule engine" );
+
+    // Reload the rules so edits to the .kicad_dru file are picked up.  A board without a file name
+    // (not yet saved) keeps whatever rules the engine already has.
+    if( wxString rulesPath = board()->GetDesignRulesPath(); !rulesPath.IsEmpty() )
+    {
+        try
+        {
+            engine->InitEngine( rulesPath );
+        }
+        catch( const PARSE_ERROR& error )
+        {
+            return badRequest( fmt::format( "custom design rules could not be compiled: {}",
+                                            error.What().ToStdString() ) );
+        }
+    }
+
+    WX_STRING_REPORTER reporter;
+    DRC_CONSTRAINT     constraint = engine->EvalRules( type, *itemA, itemB ? *itemB : nullptr, layer,
+                                                       aCtx.Request.include_report() ? &reporter : nullptr );
+
+    QueryConstraintResponse response;
+    response.set_found( !constraint.IsNull() );
+
+    if( !constraint.IsNull() )
+    {
+        const MINOPTMAX<int>& value = constraint.GetValue();
+
+        if( value.HasMin() )
+            response.set_min( value.Min() );
+
+        if( value.HasOpt() )
+            response.set_opt( value.Opt() );
+
+        if( value.HasMax() )
+            response.set_max( value.Max() );
+
+        response.set_source( constraint.GetName().ToUTF8() );
+        response.set_severity( ToProtoEnum<SEVERITY, types::RuleSeverity>( constraint.GetSeverity() ) );
+    }
+
+    if( aCtx.Request.include_report() )
+        response.set_report( reporter.GetMessages().ToUTF8() );
+
+    return response;
+}
+
+
+HANDLER_RESULT<RouteConnectionResponse> API_HANDLER_PCB::handleRouteConnection(
+            const HANDLER_CONTEXT<RouteConnection>& aCtx )
+{
+    if( HANDLER_RESULT<bool> documentValidation = validateDocument( aCtx.Request.board() ); !documentValidation )
+        return tl::unexpected( documentValidation.error() );
+
+    if( std::optional<ApiResponseStatus> busy = checkForBusy() )
+        return tl::unexpected( *busy );
+
+    auto badRequest =
+            []( const std::string& aMessage ) -> tl::unexpected<ApiResponseStatus>
+            {
+                ApiResponseStatus e;
+                e.set_status( ApiStatusCode::AS_BAD_REQUEST );
+                e.set_error_message( aMessage );
+                return tl::unexpected( e );
+            };
+
+    std::optional<BOARD_ITEM*> startBoardItem = getItemById( KIID( aCtx.Request.start_item().value() ) );
+    std::optional<BOARD_ITEM*> endBoardItem = getItemById( KIID( aCtx.Request.end_item().value() ) );
+
+    if( !startBoardItem || !( *startBoardItem )->IsConnected() )
+        return badRequest( "start_item must be an existing pad, via or track" );
+
+    if( !endBoardItem || !( *endBoardItem )->IsConnected() )
+        return badRequest( "end_item must be an existing pad, via or track" );
+
+    auto defaultPosition =
+            []( BOARD_ITEM* aItem, bool aHasExplicit ) -> std::optional<VECTOR2I>
+            {
+                if( aItem->Type() == PCB_PAD_T || aItem->Type() == PCB_VIA_T )
+                    return aItem->GetPosition();
+
+                return aHasExplicit ? std::optional<VECTOR2I>( VECTOR2I() ) : std::nullopt;
+            };
+
+    std::optional<VECTOR2I> start = defaultPosition( *startBoardItem, aCtx.Request.has_start_position() );
+    std::optional<VECTOR2I> end = defaultPosition( *endBoardItem, aCtx.Request.has_end_position() );
+
+    if( !start || !end )
+        return badRequest( "start_position/end_position are required when routing from or to a track" );
+
+    if( aCtx.Request.has_start_position() )
+        start = UnpackVector2( aCtx.Request.start_position() );
+
+    if( aCtx.Request.has_end_position() )
+        end = UnpackVector2( aCtx.Request.end_position() );
+
+    PCB_LAYER_ID layer = UNDEFINED_LAYER;
+
+    if( aCtx.Request.has_layer() )
+    {
+        layer = FromProtoEnum<PCB_LAYER_ID, board::types::BoardLayer>( aCtx.Request.layer() );
+    }
+    else
+    {
+        LSET copper = ( *startBoardItem )->GetLayerSet() & LSET::AllCuMask();
+
+        if( copper.any() )
+            layer = copper.Seq().front();
+    }
+
+    if( !IsCopperLayer( layer ) || !board()->IsLayerEnabled( layer ) )
+        return badRequest( "layer must be an enabled copper layer" );
+
+    // The router resolves clearances through the board's rule engine
+    if( std::shared_ptr<DRC_ENGINE> engine = board()->GetDesignSettings().m_DRCEngine )
+    {
+        if( wxString rulesPath = board()->GetDesignRulesPath(); !rulesPath.IsEmpty() )
+        {
+            try
+            {
+                engine->InitEngine( rulesPath );
+            }
+            catch( const PARSE_ERROR& error )
+            {
+                return badRequest( fmt::format( "custom design rules could not be compiled: {}",
+                                                error.What().ToStdString() ) );
+            }
+        }
+    }
+
+    API_PNS_IFACE iface( board(), toolManager(), _( "Route via API" ) );
+    PNS::ROUTER   router;
+
+    router.SetInterface( &iface );
+    router.ClearWorld();
+    router.SyncWorld();
+
+    PNS::ROUTING_SETTINGS settings( nullptr, "" );
+
+    switch( aCtx.Request.collision_mode() )
+    {
+    case RouterCollisionMode::RCM_SHOVE:          settings.SetMode( PNS::RM_Shove );         break;
+    case RouterCollisionMode::RCM_MARK_OBSTACLES: settings.SetMode( PNS::RM_MarkObstacles ); break;
+    default:                                      settings.SetMode( PNS::RM_Walkaround );    break;
+    }
+
+    router.LoadSettings( &settings );
+    router.SetMode( aCtx.Request.mode() == RouterMode::RTM_DIFF_PAIR ? PNS::PNS_MODE_ROUTE_DIFF_PAIR
+                                                                     : PNS::PNS_MODE_ROUTE_SINGLE );
+
+    PNS::ITEM* startItem = router.GetWorld()->FindItemByParent( static_cast<BOARD_CONNECTED_ITEM*>( *startBoardItem ) );
+    PNS::ITEM* endItem = router.GetWorld()->FindItemByParent( static_cast<BOARD_CONNECTED_ITEM*>( *endBoardItem ) );
+
+    const int pnsLayer = iface.GetPNSLayerFromBoardLayer( layer );
+    iface.SetStartLayerFromPCBNew( layer );
+
+    PNS::SIZES_SETTINGS sizes( router.Sizes() );
+    iface.ImportSizes( sizes, startItem, nullptr, *start );
+
+    if( aCtx.Request.has_track_width() )
+    {
+        int width = static_cast<int>( aCtx.Request.track_width().value_nm() );
+        sizes.SetTrackWidth( width );
+        sizes.SetTrackWidthIsExplicit( true );
+        sizes.SetDiffPairWidth( width );
+    }
+
+    if( aCtx.Request.has_diff_pair_gap() )
+        sizes.SetDiffPairGap( static_cast<int>( aCtx.Request.diff_pair_gap().value_nm() ) );
+
+    router.UpdateSizes( sizes );
+
+    RouteConnectionResponse response;
+
+    if( !router.StartRouting( *start, startItem, pnsLayer ) )
+    {
+        response.set_success( false );
+        response.set_failure_reason( router.FailureReason().ToUTF8() );
+        return response;
+    }
+
+    for( const types::Vector2& waypoint : aCtx.Request.waypoints() )
+    {
+        VECTOR2I point = UnpackVector2( waypoint );
+        router.Move( point, nullptr );
+        router.FixRoute( point, nullptr, false, false );
+    }
+
+    router.Move( *end, endItem );
+    bool reachedEnd = router.FixRoute( *end, endItem, false, false );
+
+    if( reachedEnd )
+    {
+        router.CommitRouting();
+    }
+    else
+    {
+        response.set_failure_reason( router.FailureReason().IsEmpty()
+                                             ? std::string( "the router could not reach the end item" )
+                                             : router.FailureReason().ToStdString() );
+    }
+
+    router.StopRouting();
+
+    response.set_success( reachedEnd && iface.Committed() );
+
+    if( iface.Committed() )
+    {
+        for( BOARD_ITEM* item : iface.AddedItems() )
+            item->Serialize( *response.add_created_items() );
+
+        for( const KIID& id : iface.RemovedItems() )
+            response.add_removed_items()->set_value( id.AsStdString() );
     }
 
     return response;

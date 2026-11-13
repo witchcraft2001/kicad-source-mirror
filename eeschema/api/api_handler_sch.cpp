@@ -43,6 +43,7 @@
 #include <connectivity/conn_facade.h>
 #include <advanced_config.h>
 #include <sch_commit.h>
+#include <sch_reference_list.h>
 #include <string_utils.h>
 #include <sch_edit_frame.h>
 #include <io/kicad/kicad_io_utils.h>
@@ -56,6 +57,7 @@
 #include <sch_sheet.h>
 #include <sch_sheet_path.h>
 #include <sch_sheet_pin.h>
+#include <sch_connection.h>
 #include <sch_symbol.h>
 #include <schematic.h>
 #include <variant_proxy_undo_item.h>
@@ -181,6 +183,8 @@ API_HANDLER_SCH::API_HANDLER_SCH( std::shared_ptr<SCH_CONTEXT> aContext,
     registerHandler<GetPageSettings, types::PageSettings>( &API_HANDLER_SCH::handleGetPageSettings );
     registerHandler<SetPageSettings, types::PageSettings>( &API_HANDLER_SCH::handleSetPageSettings );
     registerHandler<GetSchematicNetlist, SchematicNetlistResponse>( &API_HANDLER_SCH::handleGetSchematicNetlist );
+    registerHandler<GetSymbolPins, SymbolPinsResponse>( &API_HANDLER_SCH::handleGetSymbolPins );
+    registerHandler<AnnotateSchematic, AnnotateSchematicResponse>( &API_HANDLER_SCH::handleAnnotateSchematic );
     registerHandler<CrossProbeAnnounce, CrossProbeAnnounceResponse>( &API_HANDLER_SCH::handleCrossProbeAnnounce );
     registerHandler<kiapi::schematic::tasks::StartErcTask, kiapi::common::tasks::StartTaskResponse>(
             &API_HANDLER_SCH::handleStartErcTask );
@@ -3196,6 +3200,286 @@ API_HANDLER_SCH::handleGetCurrentVariant( const HANDLER_CONTEXT<GetCurrentVarian
 
     return response;
 }
+
+HANDLER_RESULT<kiapi::schematic::commands::AnnotateSchematicResponse>
+API_HANDLER_SCH::handleAnnotateSchematic( const HANDLER_CONTEXT<kiapi::schematic::commands::AnnotateSchematic>& aCtx )
+{
+    using namespace kiapi::schematic::commands;
+
+    HANDLER_RESULT<bool> documentValidation = validateDocument( aCtx.Request.document() );
+
+    if( !documentValidation )
+        return tl::unexpected( documentValidation.error() );
+
+    if( std::optional<ApiResponseStatus> busy = checkForBusy() )
+        return tl::unexpected( *busy );
+
+    SCHEMATIC&     sch = *schematic();
+    SCH_SHEET_LIST sheets = sch.Hierarchy();
+
+    if( sheets.empty() )
+    {
+        ApiResponseStatus e;
+        e.set_status( ApiStatusCode::AS_BAD_REQUEST );
+        e.set_error_message( "schematic has no sheets" );
+        return tl::unexpected( e );
+    }
+
+    SCH_SHEET_PATH sheet = sheets[0];
+
+    if( aCtx.Request.document().has_sheet_path() )
+    {
+        std::optional<SCH_SHEET_PATH> path =
+                sheets.GetSheetPathByKIIDPath( UnpackSheetPath( aCtx.Request.document().sheet_path() ) );
+
+        if( !path )
+        {
+            ApiResponseStatus e;
+            e.set_status( ApiStatusCode::AS_BAD_REQUEST );
+            e.set_error_message( "sheet path not found" );
+            return tl::unexpected( e );
+        }
+
+        sheet = *path;
+    }
+
+    const bool wholeSchematic = aCtx.Request.scope() != ANS_SHEET;
+    const ANNOTATE_SCOPE_T scope = wholeSchematic ? ANNOTATE_ALL : ANNOTATE_CURRENT_SHEET;
+    const ANNOTATE_ORDER_T order = aCtx.Request.order() == ANO_Y_POSITION ? SORT_BY_Y_POSITION : SORT_BY_X_POSITION;
+    ANNOTATE_ALGO_T        algorithm = INCREMENTAL_BY_REF;
+
+    if( aCtx.Request.algorithm() == ANA_SHEET_X100 )
+        algorithm = SHEET_NUMBER_X_100;
+    else if( aCtx.Request.algorithm() == ANA_SHEET_X1000 )
+        algorithm = SHEET_NUMBER_X_1000;
+
+    // AnnotateReferences takes the number to start *after* (like the dialog's "first free number after")
+    const int  startAfter = std::max( 1, aCtx.Request.start_number() ) - 1;
+    const bool recursive = aCtx.Request.recursive();
+
+    // Sub-sheets of the target sheet, relative to the full hierarchy, for recursive sheet scope
+    std::vector<SCH_SHEET_PATH> subSheetPaths;
+
+    if( !wholeSchematic && recursive )
+    {
+        std::vector<SCH_ITEM*> childSheets;
+        sheet.LastScreen()->GetSheets( &childSheets );
+
+        for( SCH_ITEM* item : childSheets )
+        {
+            SCH_SHEET_PATH childPath = sheet;
+            childPath.push_back( static_cast<SCH_SHEET*>( item ) );
+            sheets.GetSheetsWithinPath( subSheetPaths, childPath );
+        }
+    }
+
+    SCH_SHEET_LIST subSheets;
+
+    for( const SCH_SHEET_PATH& path : subSheetPaths )
+        subSheets.push_back( path );
+
+    // Remember the current references to report what changed
+    std::map<KIID_PATH, wxString> previous;
+
+    auto collect =
+            [&]( SCH_REFERENCE_LIST& aRefs )
+            {
+                if( wholeSchematic )
+                {
+                    sheets.GetSymbols( aRefs, SYMBOL_FILTER_NON_POWER );
+                }
+                else
+                {
+                    sheet.GetSymbols( aRefs, SYMBOL_FILTER_NON_POWER );
+
+                    if( recursive )
+                        subSheets.GetSymbolsWithinPath( aRefs, sheet, SYMBOL_FILTER_NON_POWER );
+                }
+            };
+
+    {
+        SCH_REFERENCE_LIST before;
+        collect( before );
+
+        for( size_t i = 0; i < before.GetCount(); i++ )
+        {
+            KIID_PATH key = before[i].GetSheetPath().Path();
+            key.push_back( before[i].GetSymbol()->m_Uuid );
+            previous[key] = before[i].GetSymbol()->GetRef( &before[i].GetSheetPath(), true );
+        }
+    }
+
+    SCH_MULTI_UNIT_REFERENCE_MAP locked;
+
+    if( !aCtx.Request.regroup_units() )
+    {
+        if( wholeSchematic )
+        {
+            sheets.GetMultiUnitSymbols( locked, SYMBOL_FILTER_NON_POWER );
+        }
+        else
+        {
+            sheet.GetMultiUnitSymbols( locked, SYMBOL_FILTER_NON_POWER );
+
+            if( recursive )
+                subSheets.GetMultiUnitSymbols( locked, SYMBOL_FILTER_NON_POWER );
+        }
+    }
+
+    sch.SetSheetNumberAndCount();
+
+    SCH_REFERENCE_LIST references;
+    collect( references );
+
+    if( std::optional<std::pair<SCH_SHEET_PATH, SCH_SHEET_PATH>> collision =
+                FindRefSuffixCollision( references, sch ) )
+    {
+        ApiResponseStatus e;
+        e.set_status( ApiStatusCode::AS_BAD_REQUEST );
+        e.set_error_message( fmt::format( "sheets {} and {} reuse a schematic with the same reference suffix",
+                                          collision->second.PathHumanReadable( false, true ).ToStdString(),
+                                          collision->first.PathHumanReadable( false, true ).ToStdString() ) );
+        return tl::unexpected( e );
+    }
+
+    SCH_COMMIT* commit = static_cast<SCH_COMMIT*>( getCurrentCommit( aCtx.ClientName ) );
+
+    AnnotateReferences( references, std::move( locked ), sch, scope, order, algorithm, startAfter,
+                        aCtx.Request.reset_existing(),
+                        [&]( SCH_REFERENCE& aRef )
+                        {
+                            commit->Modify( aRef.GetSymbol(), aRef.GetSheetPath().LastScreen() );
+                        } );
+
+    AnnotateSchematicResponse response;
+
+    for( size_t i = 0; i < references.GetCount(); i++ )
+    {
+        SCH_REFERENCE&  ref = references[i];
+        SCH_SYMBOL*     symbol = ref.GetSymbol();
+        SCH_SHEET_PATH& path = ref.GetSheetPath();
+
+        KIID_PATH key = path.Path();
+        key.push_back( symbol->m_Uuid );
+
+        wxString oldRef = previous[key];
+        wxString newRef = symbol->GetRef( &path, true );
+
+        if( oldRef == newRef )
+            continue;
+
+        AnnotationChange* change = response.add_changes();
+        change->mutable_symbol()->set_value( symbol->m_Uuid.AsStdString() );
+        PackSheetPath( *change->mutable_path(), path );
+
+        if( !oldRef.EndsWith( wxS( "?" ) ) )
+            change->set_old_reference( oldRef.ToUTF8() );
+
+        change->set_new_reference( newRef.ToUTF8() );
+    }
+
+    for( const SCH_SHEET_PATH& path : sheets )
+        path.UpdateAllScreenReferences();
+
+    if( !m_activeClients.contains( aCtx.ClientName ) )
+        pushCurrentCommit( aCtx.ClientName, _( "Annotated schematic via API" ) );
+
+    return response;
+}
+
+
+HANDLER_RESULT<kiapi::schematic::commands::SymbolPinsResponse>
+API_HANDLER_SCH::handleGetSymbolPins( const HANDLER_CONTEXT<kiapi::schematic::commands::GetSymbolPins>& aCtx )
+{
+    using namespace kiapi::schematic::commands;
+
+    HANDLER_RESULT<bool> documentValidation = validateDocument( aCtx.Request.document() );
+
+    if( !documentValidation )
+        return tl::unexpected( documentValidation.error() );
+
+    SCH_SHEET_LIST                hierarchy = schematic()->Hierarchy();
+    std::optional<SCH_SHEET_PATH> pathFilter;
+
+    if( aCtx.Request.document().has_sheet_path() )
+        pathFilter = hierarchy.GetSheetPathByKIIDPath( UnpackSheetPath( aCtx.Request.document().sheet_path() ) );
+
+    std::set<KIID> wanted;
+
+    for( const kiapi::common::types::KIID& id : aCtx.Request.symbols() )
+        wanted.insert( KIID( id.value() ) );
+
+    SymbolPinsResponse response;
+    std::set<KIID>     found;
+
+    auto processPath =
+            [&]( const SCH_SHEET_PATH& aPath )
+            {
+                const SCH_SCREEN* screen = aPath.LastScreen();
+
+                if( !screen )
+                    return;
+
+                for( SCH_ITEM* item : screen->Items().OfType( SCH_SYMBOL_T ) )
+                {
+                    SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+
+                    if( !wanted.empty() && !wanted.contains( symbol->m_Uuid ) )
+                        continue;
+
+                    found.insert( symbol->m_Uuid );
+
+                    SymbolPins* entry = response.add_symbols();
+                    entry->mutable_symbol()->set_value( symbol->m_Uuid.AsStdString() );
+                    PackSheetPath( *entry->mutable_path(), aPath );
+                    entry->set_reference( symbol->GetRef( &aPath ).ToUTF8() );
+
+                    for( SCH_PIN* pin : symbol->GetPins( &aPath ) )
+                    {
+                        PlacedSymbolPin* info = entry->add_pins();
+                        info->mutable_id()->set_value( pin->m_Uuid.AsStdString() );
+                        info->set_number( pin->GetNumber().ToUTF8() );
+                        info->set_name( pin->GetShownName().ToUTF8() );
+                        PackVector2( *info->mutable_position(), pin->GetPosition(), schIUScale );
+                        info->set_orientation(
+                                ToProtoEnum<PIN_ORIENTATION, kiapi::schematic::types::SchematicPinOrientation>(
+                                        pin->PinDrawOrient( symbol->GetTransform() ) ) );
+                        info->set_electrical_type(
+                                ToProtoEnum<ELECTRICAL_PINTYPE, kiapi::common::types::ElectricalPinType>(
+                                        pin->GetType() ) );
+
+                        if( SCH_CONNECTION* connection = pin->Connection( &aPath ) )
+                            info->set_net_name( connection->Name().ToUTF8() );
+
+                        info->set_dangling( pin->IsDangling() );
+                    }
+                }
+            };
+
+    if( pathFilter )
+    {
+        processPath( *pathFilter );
+    }
+    else
+    {
+        for( const SCH_SHEET_PATH& path : hierarchy )
+            processPath( path );
+    }
+
+    for( const KIID& id : wanted )
+    {
+        if( !found.contains( id ) )
+        {
+            ApiResponseStatus e;
+            e.set_status( ApiStatusCode::AS_BAD_REQUEST );
+            e.set_error_message( fmt::format( "symbol {} not found", id.AsStdString() ) );
+            return tl::unexpected( e );
+        }
+    }
+
+    return response;
+}
+
 
 
 HANDLER_RESULT<PlaceFromLibraryResponse> API_HANDLER_SCH::handlePlaceSymbolFromLibrary(

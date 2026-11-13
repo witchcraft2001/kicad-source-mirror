@@ -22,7 +22,16 @@
 
 #include <string>
 #include <nng/nng.h>
+
+// nng 2.x declares the protocol functions in nng.h and drops the per-protocol headers
+#if NNG_MAJOR_VERSION < 2
 #include <nng/protocol/reqrep0/req.h>
+#else
+#ifndef nng_close
+#define nng_close( aSocket ) nng_socket_close( aSocket )
+#endif
+#endif
+
 #include <wx/string.h>
 
 #include <google/protobuf/message.h>

@@ -24,6 +24,7 @@
 #include <tuple>
 
 #include <api/api_handler_common.h>
+#include <wx/filename.h>
 #include <api/api_task_scheduler.h>
 #include <build_version.h>
 #include <eda_shape.h>
@@ -134,7 +135,16 @@ tl::expected<bool, ApiResponseStatus> API_HANDLER_COMMON::validateProject( const
         return tl::unexpected( e );
     }
 
-    if( !aProject.path().empty() && aProject.path() != prj.GetProjectPath().utf8_string() )
+    // Document specifiers from the editors carry the project directory without a trailing
+    // separator while GetProjectPath() has one, so compare the directories, not the strings.
+    auto sameDirectory =
+            []( const wxString& aLeft, const wxString& aRight )
+            {
+                return wxFileName::DirName( aLeft ).GetPath() == wxFileName::DirName( aRight ).GetPath();
+            };
+
+    if( !aProject.path().empty()
+        && !sameDirectory( wxString::FromUTF8( aProject.path() ), prj.GetProjectPath() ) )
     {
         ApiResponseStatus e;
         e.set_status( ApiStatusCode::AS_BAD_REQUEST );

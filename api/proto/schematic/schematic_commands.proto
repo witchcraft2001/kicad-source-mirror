@@ -80,3 +80,131 @@ message PlaceSymbolFromLibrary
   // depending on the user's current auto-annotation preference.
   optional string reference = 6;
 }
+
+// Retrieves the pins of placed symbols in sheet coordinates, after the symbol's rotation and
+// mirroring have been applied.  This is the point where a wire must end to connect to the pin.
+// Returns SymbolPinsResponse
+// Since: 11.0
+message GetSymbolPins
+{
+  // The schematic.  If document.sheet_path is set, only symbols on that sheet are considered and
+  // net names are resolved for that sheet instance.
+  kiapi.common.types.DocumentSpecifier document = 1;
+
+  // Symbols to report.  If empty, every symbol in scope is reported.
+  repeated kiapi.common.types.KIID symbols = 2;
+}
+
+// Since: 11.0
+message PlacedSymbolPin
+{
+  kiapi.common.types.KIID id = 1;
+  string number = 2;
+  string name = 3;
+
+  // Connection point of the pin in sheet coordinates
+  kiapi.common.types.Vector2 position = 4;
+
+  // Orientation of the pin on the sheet (after symbol rotation and mirroring).  A wire leaves the
+  // connection point in the opposite direction.
+  kiapi.schematic.types.SchematicPinOrientation orientation = 5;
+
+  kiapi.common.types.ElectricalPinType electrical_type = 6;
+
+  // Name of the net connected to the pin, if connectivity has been computed
+  string net_name = 7;
+
+  // True if nothing is connected to the pin
+  bool dangling = 8;
+}
+
+// Since: 11.0
+message SymbolPins
+{
+  kiapi.common.types.KIID symbol = 1;
+  kiapi.common.types.SheetPath path = 2;
+  string reference = 3;
+  repeated PlacedSymbolPin pins = 4;
+}
+
+// Since: 11.0
+message SymbolPinsResponse
+{
+  repeated SymbolPins symbols = 1;
+}
+
+// Since: 11.0
+enum AnnotationScope
+{
+  ANS_UNKNOWN = 0;
+
+  // Every symbol in the schematic
+  ANS_ALL = 1;
+
+  // Symbols on the sheet given in document.sheet_path (the root sheet if unset)
+  ANS_SHEET = 2;
+}
+
+// Since: 11.0
+enum AnnotationOrder
+{
+  ANO_UNKNOWN = 0;
+  ANO_X_POSITION = 1;  // left to right, then top to bottom
+  ANO_Y_POSITION = 2;  // top to bottom, then left to right
+}
+
+// Since: 11.0
+enum AnnotationAlgorithm
+{
+  ANA_UNKNOWN = 0;
+  ANA_INCREMENTAL = 1;    // first free number after start_number
+  ANA_SHEET_X100 = 2;     // sheet number * 100 + first free number
+  ANA_SHEET_X1000 = 3;    // sheet number * 1000 + first free number
+}
+
+// Assigns reference designators, like the Annotate Schematic dialog.  Power symbols are skipped.
+// The change is a single undoable commit (or part of the client's open commit).
+// Returns AnnotateSchematicResponse
+// Since: 11.0
+message AnnotateSchematic
+{
+  kiapi.common.types.DocumentSpecifier document = 1;
+
+  // Defaults to ANS_ALL
+  AnnotationScope scope = 2;
+
+  // Defaults to ANO_X_POSITION
+  AnnotationOrder order = 3;
+
+  // Defaults to ANA_INCREMENTAL
+  AnnotationAlgorithm algorithm = 4;
+
+  // First number to use with ANA_INCREMENTAL; values below 1 are treated as 1
+  int32 start_number = 5;
+
+  // Renumber every symbol in scope instead of only the unannotated ones (R? style)
+  bool reset_existing = 6;
+
+  // With ANS_SHEET, also annotate the sheets below the given one
+  bool recursive = 7;
+
+  // Allow units of multi-unit symbols to be regrouped into new packages
+  bool regroup_units = 8;
+}
+
+// Since: 11.0
+message AnnotationChange
+{
+  kiapi.common.types.KIID symbol = 1;
+  kiapi.common.types.SheetPath path = 2;
+
+  // Empty if the symbol had no reference before (for example "R?")
+  string old_reference = 3;
+  string new_reference = 4;
+}
+
+// Since: 11.0
+message AnnotateSchematicResponse
+{
+  repeated AnnotationChange changes = 1;
+}

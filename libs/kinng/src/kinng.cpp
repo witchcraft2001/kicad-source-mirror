@@ -20,7 +20,16 @@
 
 #include <kinng.h>
 #include <nng/nng.h>
+
+// nng 2.x declares the protocol functions in nng.h and drops the per-protocol headers
+#if NNG_MAJOR_VERSION < 2
 #include <nng/protocol/reqrep0/rep.h>
+#else
+#ifndef nng_close
+#define nng_close( aSocket ) nng_socket_close( aSocket )
+#endif
+#endif
+
 #include <wx/log.h>
 
 
@@ -96,6 +105,11 @@ void KINNG_REQUEST_SERVER::listenThread()
 
     wxLogTrace( TraceNng, wxS( "KINNG_REQUEST_SERVER starting" ) );
 
+#if NNG_MAJOR_VERSION >= 2
+    // nng 2.x must be initialized before any other call; repeated calls are harmless
+    nng_init( nullptr );
+#endif
+
     retCode = nng_rep0_open( &socket );
 
     if( retCode != 0 )
@@ -133,27 +147,26 @@ void KINNG_REQUEST_SERVER::listenThread()
 
     while( !m_shutdown.load() )
     {
-        char*    buf = nullptr;
-        size_t   sz = 0;
+        // nng_recvmsg works with both nng 1.x and 2.x (2.x removed NNG_FLAG_ALLOC)
+        nng_msg* msg = nullptr;
 
-        retCode = nng_recv( socket, &buf, &sz, NNG_FLAG_ALLOC );
+        retCode = nng_recvmsg( socket, &msg, 0 );
 
         if( retCode == NNG_ETIMEDOUT )
             continue;
 
         if( retCode != 0 )
         {
-            if( buf )
-                nng_free( buf, sz );
+            if( msg )
+                nng_msg_free( msg );
 
             wxLogTrace( TraceNng,
                         wxString::Format( wxS( "Got error code %d from nngc_recv!" ), retCode ) );
             break;
         }
 
-        m_sharedMessage.assign( buf, sz );
-        nng_free( buf, sz );
-        buf = nullptr;
+        m_sharedMessage.assign( static_cast<const char*>( nng_msg_body( msg ) ), nng_msg_len( msg ) );
+        nng_msg_free( msg );
 
         if( m_callback )
             m_callback( &m_sharedMessage );
