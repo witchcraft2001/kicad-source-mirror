@@ -742,19 +742,23 @@ HANDLER_RESULT<BoardStackupResponse> API_HANDLER_PCB::handleUpdateBoardStackup(
     BOARD_DESIGN_SETTINGS& bds = brd->GetDesignSettings();
     BOARD_STACKUP          requested;
 
-    if( !requested.Deserialize( aCtx.Request.stackup() ) )
-    {
-        return badRequest( "the stackup is not valid: it must list copper layers from top to bottom "
-                           "with dielectric layers between them and non-negative physical values" );
-    }
+    if( std::string error; !requested.Deserialize( aCtx.Request.stackup(), &error ) )
+        return badRequest( "the stackup is not valid: " + error );
 
-    LSET     enabled = brd->GetEnabledLayers();
-    LSEQ     boardCopper = enabled.CuStack();
-    LSEQ     stackupCopper;
-    LSET     stackupLayers;
+    LSET enabled = brd->GetEnabledLayers();
+    LSEQ boardCopper = enabled.CuStack();
+    LSEQ stackupCopper;
+    LSET stackupLayers;
 
     for( BOARD_STACKUP_ITEM* item : requested.GetList() )
     {
+        // Dropping one of these would join two copper layers, so they cannot be disabled
+        if( !item->IsEnabled()
+            && ( item->GetType() == BS_ITEM_TYPE_COPPER || item->GetType() == BS_ITEM_TYPE_DIELECTRIC ) )
+        {
+            return badRequest( "copper and dielectric layers cannot be disabled" );
+        }
+
         if( item->GetType() == BS_ITEM_TYPE_COPPER )
             stackupCopper.push_back( item->GetBrdLayerId() );
 

@@ -1423,7 +1423,10 @@ bool PCB_TUNING_PATTERN::Update( GENERATOR_TOOL* aTool, BOARD* aBoard, BOARD_COM
     m_settings = placer->MeanderSettings();
     m_lastNetName = iface->GetNetName( startItem->Net() );
     m_tuningStatus = placer->TuningStatus();
-    m_tuningLength = placer->TuningLengthResult();
+
+    // In time domain mode the result is a delay: the tuning info below and the API state report it
+    // as such
+    m_tuningLength = m_settings.m_isTimeDomain ? placer->TuningDelayResult() : placer->TuningLengthResult();
 
     // Take the display units from the board, which tracks the frame's user units; time-domain
     // tuning always displays in picoseconds.

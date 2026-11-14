@@ -41,7 +41,10 @@
 #include <pcb_marker.h>
 #include <pcb_generator.h>
 #include <pcb_track.h>
+#include <netclass.h>
 #include <pgm_base.h>
+#include <project/net_settings.h>
+#include <project/project_file.h>
 #include <settings/settings_manager.h>
 #include <zone.h>
 #include <zone_filler.h>
@@ -314,7 +317,7 @@ kiapi::common::commands::ItemCreationResult createItem( API_HANDLER_PCB& aHandle
 {
     kiapi::common::commands::CreateItems command;
     *command.mutable_header()->mutable_document() = makeBoardDocument( aBoard );
-    command.add_items()->PackFrom( aItem );
+    BOOST_REQUIRE( command.add_items()->PackFrom( aItem ) );
 
     kiapi::common::ApiRequest request = packRequest( command );
     API_RESULT                result = aHandler.Handle( request );
@@ -1793,6 +1796,48 @@ BOOST_AUTO_TEST_CASE( UpdateBoardStackupRejectsCopperMismatch )
     result = updateStackup( handler, *board, noDielectric );
     BOOST_REQUIRE( !result.has_value() );
     BOOST_CHECK_EQUAL( result.error().status(), kiapi::common::ApiStatusCode::AS_BAD_REQUEST );
+    BOOST_CHECK( result.error().error_message().find( "separated by dielectric" ) != std::string::npos );
+
+    // The top solder mask cannot sit between copper layers
+    BoardStackup maskInside = stackup;
+    auto*        maskLayers = maskInside.mutable_layers();
+    int          maskIdx = -1;
+    int          dielectricIdx = -1;
+
+    for( int i = 0; i < maskLayers->size(); ++i )
+    {
+        if( maskIdx < 0 && maskLayers->Get( i ).layer() == kiapi::board::types::BoardLayer::BL_F_Mask )
+            maskIdx = i;
+
+        if( dielectricIdx < 0 && maskLayers->Get( i ).type() == BoardStackupLayerType::BSLT_DIELECTRIC )
+            dielectricIdx = i;
+    }
+
+    BOOST_REQUIRE( maskIdx >= 0 && dielectricIdx > maskIdx );
+    BoardStackupLayer mask = maskLayers->Get( maskIdx );
+    *maskLayers->Mutable( maskIdx ) = maskLayers->Get( dielectricIdx - 1 );   // F.Cu moves up
+    *maskLayers->Mutable( dielectricIdx - 1 ) = maskLayers->Get( dielectricIdx );
+    *maskLayers->Mutable( dielectricIdx ) = mask;
+
+    result = updateStackup( handler, *board, maskInside );
+    BOOST_REQUIRE( !result.has_value() );
+    BOOST_CHECK( result.error().error_message().find( "outside the copper" ) != std::string::npos );
+
+    // Disabling a dielectric would join two copper layers
+    BoardStackup disabled = stackup;
+
+    for( BoardStackupLayer& layer : *disabled.mutable_layers() )
+    {
+        if( layer.type() == BoardStackupLayerType::BSLT_DIELECTRIC )
+        {
+            layer.set_enabled( false );
+            break;
+        }
+    }
+
+    result = updateStackup( handler, *board, disabled );
+    BOOST_REQUIRE( !result.has_value() );
+    BOOST_CHECK( result.error().error_message().find( "cannot be disabled" ) != std::string::npos );
 
     BoardStackup after;
     board::PackBoardStackup( *board, after );
@@ -1956,6 +2001,81 @@ BOOST_AUTO_TEST_CASE( SetTuningProfilesChangesNetDelays )
     BOOST_CHECK( !setTuningProfiles( common, duplicateLayer ).has_value() );
 
     BOOST_CHECK_EQUAL( getTuningProfiles( common ).SerializeAsString(), after.SerializeAsString() );
+}
+
+
+/// Pad-to-pad propagation delay of a net, as GetNetLengths reports it
+int64_t netDelay( API_HANDLER_PCB& aHandler, BOARD* aBoard, const std::string& aNet )
+{
+    kiapi::common::ApiRequest request = makeNetLengthsRequest( aBoard, { aNet }, true );
+    API_RESULT                result = aHandler.Handle( request );
+    BOOST_REQUIRE( result.has_value() );
+
+    kiapi::board::commands::NetLengthsResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+    BOOST_REQUIRE_EQUAL( response.nets_size(), 1 );
+
+    return response.nets( 0 ).total_delay().value_as();
+}
+
+
+BOOST_AUTO_TEST_CASE( CreateTuningPatternTunesDelay )
+{
+    using namespace kiapi::board::types;
+
+    KI_TEST::LoadBoard( Pgm().GetSettingsManager(), wxS( "length_calculations" ), m_board );
+    BOARD* board = m_board.get();
+    m_context = std::make_shared<HEADLESS_PCB_CONTEXT>( std::move( m_board ),
+                                                        &Pgm().GetSettingsManager().Prj(), nullptr );
+
+    // 6 ps/mm on F.Cu for every net, so a delay differs from the length in value
+    google::protobuf::RepeatedPtrField<kiapi::common::project::TuningProfile> profiles;
+    kiapi::common::project::TuningProfile* profile = profiles.Add();
+    profile->set_name( "QA" );
+    profile->set_type( kiapi::common::project::TuningProfileType::TPT_SINGLE );
+    profile->set_enable_time_domain_tuning( true );
+    kiapi::common::project::TuningProfileLayer* layer = profile->add_layers();
+    layer->set_signal_layer( BoardLayer::BL_F_Cu );
+    layer->set_delay_per_mm( 6000000 );
+
+    API_HANDLER_COMMON common;
+    BOOST_REQUIRE( setTuningProfiles( common, profiles ).has_value() );
+    Pgm().GetSettingsManager().Prj().GetProjectFile().m_NetSettings->GetDefaultNetclass()->SetTuningProfile(
+            wxS( "QA" ) );
+
+    API_HANDLER_PCB handler( m_context );
+    static_cast<API_HANDLER&>( handler ).onNetSettingsChanged();
+
+    const std::string net = "Net-(R1-Pad2)";
+    const int64_t     before = netDelay( handler, board, net );
+    BOOST_REQUIRE( before > 0 );
+
+    const int64_t target = before + 30000000;  // +30 ps
+    const int64_t tolerance = 1000000;         // 1 ps
+
+    TuningPattern pattern = makeTuningPattern( TuningPatternMode::TPM_SINGLE,
+                                               VECTOR2I( pcbIUScale.mmToIU( 124 ), pcbIUScale.mmToIU( 48.895 ) ),
+                                               VECTOR2I( pcbIUScale.mmToIU( 134 ), pcbIUScale.mmToIU( 48.895 ) ),
+                                               pcbIUScale.mmToIU( 0.6 ) );
+    pattern.set_target_mode( TuningPatternTargetMode::TPTM_TIME_DOMAIN );
+    pattern.mutable_target_delay()->set_min_as( target - tolerance );
+    pattern.mutable_target_delay()->set_opt_as( target );
+    pattern.mutable_target_delay()->set_max_as( target + tolerance );
+
+    kiapi::common::commands::ItemCreationResult created = createItem( handler, *board, pattern );
+    BOOST_REQUIRE_MESSAGE( created.status().code() == kiapi::common::commands::ItemStatusCode::ISC_OK,
+                           created.status().error_message() );
+
+    TuningPattern result;
+    BOOST_REQUIRE( created.item().UnpackTo( &result ) );
+    BOOST_CHECK_EQUAL( result.state().status(), TuningPatternStatus::TPS_TUNED );
+
+    const int64_t after = netDelay( handler, board, net );
+    BOOST_CHECK_LE( std::abs( after - target ), tolerance );
+
+    // A time domain pattern reports the delay it reached, not the length
+    BOOST_REQUIRE( result.state().has_tuning_value() );
+    BOOST_CHECK_LE( std::abs( result.state().tuning_value() - after ), tolerance );
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -18,6 +18,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <cmath>
 #include <optional>
 #include <ranges>
 #include <set>
@@ -376,7 +377,8 @@ API_HANDLER_COMMON::handleSetTuningProfiles( const HANDLER_CONTEXT<SetTuningProf
             return badRequest( fmt::format( "tuning profile '{}' needs a type", in.name() ) );
         }
 
-        if( in.target_impedance() < 0 || in.frequency() < 0 || in.via_delay_per_mm() < 0
+        if( !std::isfinite( in.target_impedance() ) || !std::isfinite( in.frequency() )
+            || in.target_impedance() < 0 || in.frequency() < 0 || in.via_delay_per_mm() < 0
             || in.via_delay_per_mm() > intMax || in.net_chain_bridge_delay_per_mm() < 0
             || in.net_chain_bridge_delay_per_mm() > intMax )
         {

@@ -26,6 +26,7 @@
 #define BOARD_STACKUP_H
 
 
+#include <string>
 #include <vector>
 #include <wx/string.h>
 #include <layer_ids.h>
@@ -261,9 +262,10 @@ public:
      * paste and silkscreen items must name a board layer of their kind.  Colors are stored as
      * RGBA hex strings.  On failure the stackup is left unchanged.
      *
+     * @param aError receives the reason when the input is rejected (optional)
      * @return false if the input is not a valid stackup
      */
-    bool Deserialize( const kiapi::board::BoardStackup& aInput );
+    bool Deserialize( const kiapi::board::BoardStackup& aInput, std::string* aError = nullptr );
 
     const std::vector<BOARD_STACKUP_ITEM*>& GetList() const { return m_list; }
 

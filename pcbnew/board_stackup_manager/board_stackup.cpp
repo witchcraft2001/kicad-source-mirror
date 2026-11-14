@@ -21,6 +21,8 @@
 
 #include "board_stackup.h"
 #include <algorithm>
+#include <cmath>
+#include <fmt.h>
 #include <base_units.h>
 #include <string_utils.h>
 #include <layer_ids.h>
@@ -588,34 +590,51 @@ bool BOARD_STACKUP::Deserialize( const google::protobuf::Any& aContainer )
 }
 
 
-bool BOARD_STACKUP::Deserialize( const kiapi::board::BoardStackup& aInput )
+bool BOARD_STACKUP::Deserialize( const kiapi::board::BoardStackup& aInput, std::string* aError )
 {
     using namespace kiapi::board;
+
+    auto fail =
+            [&]( int aIndex, const std::string& aMessage )
+            {
+                if( aError )
+                    *aError = aIndex >= 0 ? fmt::format( "layer {}: {}", aIndex, aMessage ) : aMessage;
+
+                return false;
+            };
+
+    auto badValue =
+            []( double aValue, double aMin )
+            {
+                return !std::isfinite( aValue ) || aValue < aMin;
+            };
 
     std::vector<std::unique_ptr<BOARD_STACKUP_ITEM>> items;
     int  dielectricIdx = 0;
     bool seenCopper = false;
+    bool seenBottomCopper = false;
     bool pendingDielectric = false;     // a dielectric that is not yet closed by a copper layer
     bool betweenCopper = true;          // a dielectric has been seen since the last copper layer
 
-    for( const BoardStackupLayer& layer : aInput.layers() )
+    for( int index = 0; index < aInput.layers_size(); ++index )
     {
-        BOARD_STACKUP_ITEM_TYPE type = FromProtoEnum<BOARD_STACKUP_ITEM_TYPE>( layer.type() );
+        const BoardStackupLayer& layer = aInput.layers( index );
+        BOARD_STACKUP_ITEM_TYPE  type = FromProtoEnum<BOARD_STACKUP_ITEM_TYPE>( layer.type() );
 
         if( type == BS_ITEM_TYPE_UNDEFINED )
-            return false;
+            return fail( index, "unknown layer type" );
 
         auto item = std::make_unique<BOARD_STACKUP_ITEM>( type );
         item->SetEnabled( layer.enabled() );
 
         if( layer.thickness().value_nm() < 0 )
-            return false;
+            return fail( index, "negative thickness" );
 
         if( type == BS_ITEM_TYPE_DIELECTRIC )
         {
             // Dielectrics only make sense between two copper layers
-            if( !seenCopper )
-                return false;
+            if( !seenCopper || seenBottomCopper )
+                return fail( index, "a dielectric layer must lie between two copper layers" );
 
             pendingDielectric = true;
             betweenCopper = true;
@@ -640,10 +659,12 @@ bool BOARD_STACKUP::Deserialize( const kiapi::board::BoardStackup& aInput )
             {
                 const BoardStackupDielectricProperties& props = dielectric.layer( i );
 
-                if( props.thickness().value_nm() < 0 || props.epsilon_r() < 1.0
-                    || props.loss_tangent() < 0 )
+                if( props.thickness().value_nm() < 0 || badValue( props.epsilon_r(), 1.0 )
+                    || badValue( props.loss_tangent(), 0.0 )
+                    || ( props.has_spec_frequency() && badValue( props.spec_frequency(), 0.0 ) ) )
                 {
-                    return false;
+                    return fail( index, "dielectric sublayers need a non-negative thickness, epsilon_r "
+                                        ">= 1 and a non-negative loss tangent" );
                 }
 
                 if( i > 0 )
@@ -667,13 +688,24 @@ bool BOARD_STACKUP::Deserialize( const kiapi::board::BoardStackup& aInput )
         {
             PCB_LAYER_ID layerId = FromProtoEnum<PCB_LAYER_ID>( layer.layer() );
 
+            // Technical layers sit outside the copper: top ones before F.Cu, bottom ones after B.Cu
+            bool topSide = layerId == F_Mask || layerId == F_SilkS || layerId == F_Paste;
+            bool bottomSide = layerId == B_Mask || layerId == B_SilkS || layerId == B_Paste;
+
+            if( ( topSide && seenCopper ) || ( bottomSide && !seenBottomCopper ) )
+                return fail( index, "mask, paste and silkscreen layers must be outside the copper layers" );
+
             switch( type )
             {
             case BS_ITEM_TYPE_COPPER:
-                if( !IsCopperLayer( layerId ) || !betweenCopper )
-                    return false;
+                if( !IsCopperLayer( layerId ) )
+                    return fail( index, "a copper layer needs a copper board layer" );
+
+                if( !betweenCopper || seenBottomCopper )
+                    return fail( index, "copper layers must be separated by dielectric layers and end with B.Cu" );
 
                 seenCopper = true;
+                seenBottomCopper = layerId == B_Cu;
                 pendingDielectric = false;
                 betweenCopper = false;
                 item->SetThickness( layer.thickness().value_nm() );
@@ -682,7 +714,7 @@ bool BOARD_STACKUP::Deserialize( const kiapi::board::BoardStackup& aInput )
             case BS_ITEM_TYPE_SOLDERMASK:
             {
                 if( layerId != F_Mask && layerId != B_Mask )
-                    return false;
+                    return fail( index, "a solder mask layer must be F.Mask or B.Mask" );
 
                 item->SetTypeName( layerId == F_Mask ? _HKI( "Top Solder Mask" ) : _HKI( "Bottom Solder Mask" ) );
 
@@ -690,8 +722,12 @@ bool BOARD_STACKUP::Deserialize( const kiapi::board::BoardStackup& aInput )
 
                 if( layer.has_soldermask() )
                 {
-                    if( mask.thickness().value_nm() < 0 || mask.epsilon_r() < 1.0 || mask.loss_tangent() < 0 )
-                        return false;
+                    if( mask.thickness().value_nm() < 0 || badValue( mask.epsilon_r(), 1.0 )
+                        || badValue( mask.loss_tangent(), 0.0 ) )
+                    {
+                        return fail( index, "the solder mask needs a non-negative thickness, epsilon_r >= 1 "
+                                            "and a non-negative loss tangent" );
+                    }
 
                     item->SetThickness( mask.thickness().value_nm() );
                     item->SetEpsilonR( mask.epsilon_r() );
@@ -710,7 +746,7 @@ bool BOARD_STACKUP::Deserialize( const kiapi::board::BoardStackup& aInput )
 
             case BS_ITEM_TYPE_SILKSCREEN:
                 if( layerId != F_SilkS && layerId != B_SilkS )
-                    return false;
+                    return fail( index, "a silkscreen layer must be F.SilkS or B.SilkS" );
 
                 item->SetTypeName( layerId == F_SilkS ? _HKI( "Top Silk Screen" ) : _HKI( "Bottom Silk Screen" ) );
 
@@ -721,13 +757,13 @@ bool BOARD_STACKUP::Deserialize( const kiapi::board::BoardStackup& aInput )
 
             case BS_ITEM_TYPE_SOLDERPASTE:
                 if( layerId != F_Paste && layerId != B_Paste )
-                    return false;
+                    return fail( index, "a solder paste layer must be F.Paste or B.Paste" );
 
                 item->SetTypeName( layerId == F_Paste ? _HKI( "Top Solder Paste" ) : _HKI( "Bottom Solder Paste" ) );
                 break;
 
             default:
-                return false;
+                return fail( index, "unsupported layer type" );
             }
 
             item->SetBrdLayerId( layerId );
@@ -739,9 +775,9 @@ bool BOARD_STACKUP::Deserialize( const kiapi::board::BoardStackup& aInput )
         items.emplace_back( std::move( item ) );
     }
 
-    // A stackup must start and end with copper (ignoring the technical layers)
-    if( !seenCopper || pendingDielectric )
-        return false;
+    // A stackup must start with copper and end with B.Cu (ignoring the technical layers)
+    if( !seenCopper || !seenBottomCopper || pendingDielectric )
+        return fail( -1, "the stackup must list copper layers from the top to B.Cu" );
 
     RemoveAll();
 

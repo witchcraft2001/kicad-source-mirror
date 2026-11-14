@@ -667,7 +667,7 @@ protected:
 
     wxString              m_lastNetName;
     wxString              m_tuningInfo;
-    long long             m_tuningLength;
+    long long             m_tuningLength;   ///< Last tuned length, or delay in time domain mode
 
     PNS::MEANDER_PLACER_BASE::TUNING_STATUS m_tuningStatus;
 
