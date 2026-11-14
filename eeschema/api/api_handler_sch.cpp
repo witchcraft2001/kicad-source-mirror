@@ -155,8 +155,11 @@ API_HANDLER_SCH::API_HANDLER_SCH( std::shared_ptr<SCH_CONTEXT> aContext,
             &API_HANDLER_SCH::handleSaveDocumentToString );
     registerHandler<commands::SaveSelectionToString, commands::SavedSelectionResponse>(
             &API_HANDLER_SCH::handleSaveSelectionToString );
+    registerHandler<ParseAndCreateItemsFromString, CreateItemsResponse>(
+            &API_HANDLER_SCH::handleParseAndCreateItemsFromString );
     registerHandler<GetItems, GetItemsResponse>( &API_HANDLER_SCH::handleGetItems );
     registerHandler<GetItemsById, GetItemsResponse>( &API_HANDLER_SCH::handleGetItemsById );
+    registerHandler<GetBoundingBox, GetBoundingBoxResponse>( &API_HANDLER_SCH::handleGetBoundingBox );
 
     registerHandler<GetSelection, SelectionResponse>( &API_HANDLER_SCH::handleGetSelection );
     registerHandler<ClearSelection, Empty>( &API_HANDLER_SCH::handleClearSelection );
@@ -852,6 +855,71 @@ HANDLER_RESULT<GetItemsResponse> API_HANDLER_SCH::handleGetItemsById( const HAND
     }
 
     response.set_status( ItemRequestStatus::IRS_OK );
+    return response;
+}
+
+
+HANDLER_RESULT<GetBoundingBoxResponse>
+API_HANDLER_SCH::handleGetBoundingBox( const HANDLER_CONTEXT<GetBoundingBox>& aCtx )
+{
+    if( !validateItemHeaderDocument( aCtx.Request.header() ) )
+    {
+        ApiResponseStatus e;
+        // No message needed for AS_UNHANDLED; this is an internal flag for the API server
+        e.set_status( ApiStatusCode::AS_UNHANDLED );
+        return tl::unexpected( e );
+    }
+
+    if( std::optional<ApiResponseStatus> busy = checkForBusy() )
+        return tl::unexpected( *busy );
+
+    GetBoundingBoxResponse response;
+    bool includeText = aCtx.Request.mode() == BoundingBoxMode::BBM_ITEM_AND_CHILD_TEXT;
+
+    for( const types::KIID& idMsg : aCtx.Request.items() )
+    {
+        std::optional<SCH_ITEM*> optItem = getItemById( KIID( idMsg.value() ) );
+
+        if( !optItem )
+            continue;
+
+        SCH_ITEM* item = *optItem;
+        BOX2I     bbox;
+
+        // Without child text, report only the body of items that carry fields or text
+        switch( item->Type() )
+        {
+        case SCH_SYMBOL_T:
+        {
+            SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+            bbox = includeText ? symbol->GetBoundingBox() : symbol->GetBodyAndPinsBoundingBox();
+            break;
+        }
+
+        case SCH_SHEET_T:
+        {
+            SCH_SHEET* sheet = static_cast<SCH_SHEET*>( item );
+            bbox = includeText ? sheet->GetBoundingBox() : sheet->GetBodyBoundingBox();
+            break;
+        }
+
+        case SCH_LABEL_T:
+        case SCH_GLOBAL_LABEL_T:
+        case SCH_HIER_LABEL_T:
+        case SCH_DIRECTIVE_LABEL_T:
+        {
+            SCH_LABEL_BASE* label = static_cast<SCH_LABEL_BASE*>( item );
+            bbox = includeText ? label->GetBoundingBox() : label->GetBodyBoundingBox( nullptr );
+            break;
+        }
+
+        default: bbox = item->GetBoundingBox(); break;
+        }
+
+        response.add_items()->set_value( idMsg.value() );
+        PackBox2( *response.add_boxes(), bbox, schIUScale );
+    }
+
     return response;
 }
 

@@ -42,6 +42,18 @@ std::vector<wxString> API_HANDLER_FP_LIBRARIES::getItemNames( LIBRARY_MANAGER_AD
 }
 
 
+std::vector<LIB_TREE_ITEM*> API_HANDLER_FP_LIBRARIES::getSearchItems( LIBRARY_MANAGER_ADAPTER& aAdapter,
+                                                                      const wxString&          aNickname ) const
+{
+    std::vector<LIB_TREE_ITEM*> items;
+
+    for( FOOTPRINT* footprint : static_cast<FOOTPRINT_LIBRARY_ADAPTER&>( aAdapter ).GetFootprints( aNickname, true ) )
+        items.push_back( footprint );
+
+    return items;
+}
+
+
 bool API_HANDLER_FP_LIBRARIES::packLibraryItem( const LIB_ID& aId, google::protobuf::Any& aOutput ) const
 {
     FOOTPRINT_LIBRARY_ADAPTER* adapter =

@@ -41,6 +41,18 @@ std::vector<wxString> API_HANDLER_SCH_LIBRARIES::getItemNames( LIBRARY_MANAGER_A
 }
 
 
+std::vector<LIB_TREE_ITEM*> API_HANDLER_SCH_LIBRARIES::getSearchItems( LIBRARY_MANAGER_ADAPTER& aAdapter,
+                                                                       const wxString&          aNickname ) const
+{
+    std::vector<LIB_TREE_ITEM*> items;
+
+    for( LIB_SYMBOL* symbol : static_cast<SYMBOL_LIBRARY_ADAPTER&>( aAdapter ).GetSymbols( aNickname ) )
+        items.push_back( symbol );
+
+    return items;
+}
+
+
 bool API_HANDLER_SCH_LIBRARIES::packLibraryItem( const LIB_ID& aId, google::protobuf::Any& aOutput ) const
 {
     SYMBOL_LIBRARY_ADAPTER* adapter =

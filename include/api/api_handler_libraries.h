@@ -31,6 +31,7 @@
 #include <libraries/library_table.h>
 
 class LIB_ID;
+class LIB_TREE_ITEM;
 class LIBRARY_MANAGER_ADAPTER;
 class KIWAY;
 struct KIFACE;
@@ -63,6 +64,14 @@ protected:
     HANDLER_RESULT<kiapi::common::commands::LibraryItemsResponse>
     handleGetLibraryItems( const HANDLER_CONTEXT<kiapi::common::commands::GetLibraryItems>& aCtx );
 
+    /// Reports the rows of a library table; any instance can answer for every library type
+    HANDLER_RESULT<kiapi::common::commands::LibraryTableResponse>
+    handleGetLibraryTable( const HANDLER_CONTEXT<kiapi::common::commands::GetLibraryTable>& aCtx );
+
+    /// Ranks the items of the libraries against a query the way the library choosers do
+    HANDLER_RESULT<kiapi::common::commands::SearchLibrariesResponse>
+    handleSearchLibraries( const HANDLER_CONTEXT<kiapi::common::commands::SearchLibraries>& aCtx );
+
     HANDLER_RESULT<kiapi::common::commands::LibraryStatusResponse>
     handleGetLibraryStatuses( const HANDLER_CONTEXT<kiapi::common::commands::GetLibraryStatuses>& aCtx );
 
@@ -92,6 +101,19 @@ protected:
      * library is not loaded (or cannot be enumerated).
      */
     virtual std::vector<wxString> getItemNames( LIBRARY_MANAGER_ADAPTER& aAdapter, const wxString& aNickname ) const;
+
+    /**
+     * Returns the items of a loaded library for SearchLibraries; the pointers stay owned by the
+     * library.  Only the handlers of types that can be searched override this together with
+     * supportsSearch().
+     */
+    virtual std::vector<LIB_TREE_ITEM*> getSearchItems( LIBRARY_MANAGER_ADAPTER& aAdapter,
+                                                        const wxString&          aNickname ) const
+    {
+        return {};
+    }
+
+    virtual bool supportsSearch() const { return false; }
 
 private:
     LIBRARY_TABLE_TYPE m_type;

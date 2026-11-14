@@ -33,11 +33,16 @@
 #include <api/schematic/schematic_tasks.pb.h>
 #include <api/schematic/schematic_types.pb.h>
 #include <schematic_utils/schematic_file_util.h>
+#include <sch_io/kicad_sexpr/sch_io_kicad_sexpr.h>
+#include <richio.h>
+#include <tools/sch_selection.h>
 #include <settings/settings_manager.h>
 
 #include <schematic.h>
+#include <schematic_settings.h>
 #include <advanced_config.h>
 #include <connection_graph.h>
+#include <sch_group.h>
 #include <sch_label.h>
 #include <sch_line.h>
 #include <sch_screen.h>
@@ -760,6 +765,85 @@ SCH_SYMBOL* firstMultiPinSymbol( SCHEMATIC& aSchematic, SCH_SHEET_PATH& aPath )
     return nullptr;
 }
 
+// The text the editor puts on the clipboard for these items of aPath's screen
+std::string formatItems( SCHEMATIC& aSchematic, SCH_SHEET_PATH& aPath, const std::vector<SCH_ITEM*>& aItems )
+{
+    SCH_SELECTION selection( aPath.LastScreen() );
+
+    for( SCH_ITEM* item : aItems )
+        selection.Add( item );
+
+    STRING_FORMATTER   formatter;
+    SCH_IO_KICAD_SEXPR plugin;
+
+    plugin.Format( &selection, &aPath, aSchematic, &formatter, true );
+    return formatter.GetString();
+}
+
+
+kiapi::common::ApiRequest makePasteRequest( const SCHEMATIC& aSchematic, const std::string& aContents,
+                                            const VECTOR2I& aOffset, const SCH_SHEET_PATH* aPath = nullptr )
+{
+    kiapi::common::commands::ParseAndCreateItemsFromString command;
+    *command.mutable_document() = makeDocument( aSchematic );
+    command.set_contents( aContents );
+    kiapi::common::PackVector2( *command.mutable_offset(), aOffset, schIUScale );
+
+    if( aPath )
+        kiapi::common::PackSheetPath( *command.mutable_document()->mutable_sheet_path(), aPath->Path() );
+
+    kiapi::common::ApiRequest request;
+    request.mutable_header()->set_client_name( "kicad.qa" );
+    BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+
+    return request;
+}
+
+
+API_RESULT paste( API_HANDLER_SCH& aHandler, const SCHEMATIC& aSchematic, const std::string& aContents,
+                  const VECTOR2I& aOffset, const SCH_SHEET_PATH* aPath = nullptr )
+{
+    kiapi::common::ApiRequest request = makePasteRequest( aSchematic, aContents, aOffset, aPath );
+    return aHandler.Handle( request );
+}
+
+
+// Every non-power, single-unit reference of the design is unique
+void checkUniqueReferences( SCHEMATIC& aSchematic )
+{
+    std::set<wxString> refs;
+
+    for( const SCH_SHEET_PATH& path : aSchematic.Hierarchy() )
+    {
+        for( SCH_ITEM* item : path.LastScreen()->Items().OfType( SCH_SYMBOL_T ) )
+        {
+            SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+
+            if( symbol->IsPower() || symbol->GetUnitCount() > 1 )
+                continue;
+
+            wxString ref = symbol->GetRef( &path, false );
+
+            if( !ref.EndsWith( wxS( "?" ) ) )
+                BOOST_CHECK_MESSAGE( refs.insert( path.PathAsString() + ref ).second, "duplicate reference " << ref );
+        }
+    }
+}
+
+
+std::set<KIID> allIds( SCHEMATIC& aSchematic )
+{
+    std::set<KIID> ids;
+
+    for( const SCH_SHEET_PATH& path : aSchematic.Hierarchy() )
+    {
+        for( SCH_ITEM* item : path.LastScreen()->Items() )
+            ids.insert( item->m_Uuid );
+    }
+
+    return ids;
+}
+
 } // namespace
 
 
@@ -839,6 +923,575 @@ BOOST_AUTO_TEST_CASE( GetSymbolPinsFollowsRotation )
         BOOST_CHECK_EQUAL( p1.x, p0.y );
         BOOST_CHECK_EQUAL( p1.y, -p0.x );
     }
+}
+
+
+BOOST_AUTO_TEST_CASE( GetBoundingBoxReportsSchematicItems )
+{
+    SCHEMATIC* model = loadSchematic( wxS( "api_kitchen_sink" ) );
+
+    SCH_SHEET_PATH path;
+    SCH_SYMBOL*    symbol = firstMultiPinSymbol( *model, path );
+    BOOST_REQUIRE( symbol );
+
+    SCH_LABEL_BASE* label = nullptr;
+    SCH_SHEET*      sheet = nullptr;
+
+    for( const SCH_SHEET_PATH& p : model->Hierarchy() )
+    {
+        for( SCH_ITEM* item : p.LastScreen()->Items() )
+        {
+            if( !label && item->IsType( { SCH_LABEL_T, SCH_GLOBAL_LABEL_T, SCH_HIER_LABEL_T } ) )
+                label = static_cast<SCH_LABEL_BASE*>( item );
+
+            if( !sheet && item->Type() == SCH_SHEET_T )
+                sheet = static_cast<SCH_SHEET*>( item );
+        }
+    }
+
+    BOOST_REQUIRE( label );
+    BOOST_REQUIRE( sheet );
+
+    API_HANDLER_SCH handler( m_context );
+
+    auto query = [&]( const std::vector<KIID>& aIds, kiapi::common::commands::BoundingBoxMode aMode )
+    {
+        kiapi::common::commands::GetBoundingBox command;
+        *command.mutable_header()->mutable_document() = makeDocument( *model );
+        command.set_mode( aMode );
+
+        for( const KIID& id : aIds )
+            command.add_items()->set_value( id.AsStdString() );
+
+        kiapi::common::ApiRequest request;
+        request.mutable_header()->set_client_name( "kicad.qa" );
+        BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+
+        API_RESULT result = handler.Handle( request );
+        BOOST_REQUIRE( result.has_value() );
+        BOOST_REQUIRE_EQUAL( result->status().status(), kiapi::common::ApiStatusCode::AS_OK );
+
+        kiapi::common::commands::GetBoundingBoxResponse response;
+        BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+        return response;
+    };
+
+    auto box = []( const kiapi::common::commands::GetBoundingBoxResponse& aResponse, int aIndex )
+    {
+        return kiapi::common::UnpackBox2( aResponse.boxes( aIndex ), schIUScale );
+    };
+
+    KIID unknown;
+    auto withText = query( { symbol->m_Uuid, label->m_Uuid, sheet->m_Uuid, unknown },
+                           kiapi::common::commands::BBM_ITEM_AND_CHILD_TEXT );
+    auto bodyOnly = query( { symbol->m_Uuid, label->m_Uuid, sheet->m_Uuid },
+                           kiapi::common::commands::BBM_ITEM_ONLY );
+
+    // The unknown id is skipped
+    BOOST_REQUIRE_EQUAL( withText.items_size(), 3 );
+    BOOST_REQUIRE_EQUAL( withText.boxes_size(), 3 );
+    BOOST_REQUIRE_EQUAL( bodyOnly.boxes_size(), 3 );
+
+    BOOST_CHECK_EQUAL( withText.items( 0 ).value(), symbol->m_Uuid.AsStdString() );
+    BOOST_CHECK( box( withText, 0 ) == symbol->GetBoundingBox() );
+    BOOST_CHECK( box( bodyOnly, 0 ) == symbol->GetBodyAndPinsBoundingBox() );
+
+    BOOST_CHECK( box( withText, 1 ) == label->GetBoundingBox() );
+    BOOST_CHECK( box( bodyOnly, 1 ) == label->GetBodyBoundingBox( nullptr ) );
+
+    BOOST_CHECK( box( withText, 2 ) == sheet->GetBoundingBox() );
+    BOOST_CHECK( box( bodyOnly, 2 ) == sheet->GetBodyBoundingBox() );
+
+    // The box with child text always contains the body box
+    for( int i = 0; i < 3; ++i )
+        BOOST_CHECK( box( withText, i ).Contains( box( bodyOnly, i ) ) );
+
+    // A request for a different document type is left for another handler
+    kiapi::common::commands::GetBoundingBox boardCommand;
+    boardCommand.mutable_header()->mutable_document()->set_type( kiapi::common::types::DocumentType::DOCTYPE_PCB );
+
+    kiapi::common::ApiRequest request;
+    request.mutable_header()->set_client_name( "kicad.qa" );
+    BOOST_REQUIRE( request.mutable_message()->PackFrom( boardCommand ) );
+
+    API_RESULT result = handler.Handle( request );
+    BOOST_REQUIRE( !result.has_value() );
+    BOOST_CHECK_EQUAL( result.error().status(), kiapi::common::ApiStatusCode::AS_UNHANDLED );
+}
+
+
+BOOST_AUTO_TEST_CASE( PasteCreatesCopiesWithNewIds )
+{
+    SCHEMATIC*     model = loadSchematic( wxS( "api_kitchen_sink" ) );
+    SCH_SHEET_PATH root = model->Hierarchy().at( 0 );
+    SCH_SCREEN*    screen = root.LastScreen();
+
+    std::vector<SCH_ITEM*> source;
+    std::set<VECTOR2I>     symbolPositions;
+    size_t                 symbols = 0;
+
+    for( SCH_ITEM* item : screen->Items() )
+    {
+        if( item->Type() == SCH_SHEET_T )
+            continue;
+
+        source.push_back( item );
+
+        if( item->Type() == SCH_SYMBOL_T )
+        {
+            symbolPositions.insert( item->GetPosition() );
+            symbols++;
+        }
+    }
+
+    BOOST_REQUIRE_GT( symbols, 0u );
+
+    const std::string text = formatItems( *model, root, source );
+    const size_t      before = screen->Items().size();
+    const VECTOR2I    offset( schIUScale.MilsToIU( 4000 ), schIUScale.MilsToIU( 500 ) );
+    std::set<KIID>    idsBefore = allIds( *model );
+
+    API_HANDLER_SCH handler( m_context );
+    API_RESULT      result = paste( handler, *model, text, offset );
+
+    BOOST_REQUIRE( result.has_value() );
+    BOOST_REQUIRE_EQUAL( result->status().status(), kiapi::common::ApiStatusCode::AS_OK );
+
+    kiapi::common::commands::CreateItemsResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+
+    BOOST_CHECK_EQUAL( static_cast<size_t>( response.created_items_size() ), source.size() );
+    BOOST_CHECK_EQUAL( screen->Items().size(), before + source.size() );
+
+    for( const kiapi::common::commands::ItemCreationResult& created : response.created_items() )
+        BOOST_CHECK_EQUAL( created.status().code(), kiapi::common::commands::ItemStatusCode::ISC_OK );
+
+    // Every pasted item is new, symbols moved by the offset and carry their library symbol
+    size_t pastedSymbols = 0;
+
+    for( SCH_ITEM* item : screen->Items() )
+    {
+        if( idsBefore.contains( item->m_Uuid ) )
+            continue;
+
+        if( item->Type() == SCH_SYMBOL_T )
+        {
+            SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+            bool        moved = false;
+
+            for( const VECTOR2I& pos : symbolPositions )
+                moved |= symbol->GetPosition() == pos + offset;
+
+            BOOST_CHECK_MESSAGE( moved, "symbol not shifted by the offset" );
+            BOOST_CHECK( symbol->GetLibSymbolRef() );
+            pastedSymbols++;
+
+            for( SCH_PIN* pin : symbol->GetPins( &root ) )
+                BOOST_CHECK( !idsBefore.contains( pin->m_Uuid ) );
+        }
+    }
+
+    BOOST_CHECK_EQUAL( pastedSymbols, symbols );
+    checkUniqueReferences( *model );
+
+    // The same text pasted again does not repeat an identifier or a reference.  It goes
+    // elsewhere: wires on top of existing ones would be merged by the cleanup of the commit.
+    result = paste( handler, *model, text, offset + offset );
+    BOOST_REQUIRE( result.has_value() );
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+
+    for( const kiapi::common::commands::ItemCreationResult& created : response.created_items() )
+        BOOST_CHECK_MESSAGE( created.status().code() == kiapi::common::commands::ItemStatusCode::ISC_OK,
+                             created.status().error_message() );
+
+    size_t symbolCount = 0;
+
+    for( SCH_ITEM* item : screen->Items().OfType( SCH_SYMBOL_T ) )
+    {
+        wxUnusedVar( item );
+        symbolCount++;
+    }
+
+    BOOST_CHECK_EQUAL( symbolCount, 3 * symbols );
+    checkUniqueReferences( *model );
+}
+
+
+BOOST_AUTO_TEST_CASE( PasteRejectsInvalidContents )
+{
+    SCHEMATIC*     model = loadSchematic( wxS( "api_kitchen_sink" ) );
+    SCH_SHEET_PATH root = model->Hierarchy().at( 0 );
+    const size_t   before = root.LastScreen()->Items().size();
+
+    API_HANDLER_SCH handler( m_context );
+
+    for( const std::string& text : { std::string( "this is not a schematic" ), std::string( "(wire (pts (xy 0 0)" ),
+                                     std::string() } )
+    {
+        API_RESULT result = paste( handler, *model, text, VECTOR2I( 0, 0 ) );
+
+        BOOST_REQUIRE( !result.has_value() );
+        BOOST_CHECK_EQUAL( result.error().status(), kiapi::common::ApiStatusCode::AS_BAD_REQUEST );
+        BOOST_CHECK_EQUAL( root.LastScreen()->Items().size(), before );
+    }
+}
+
+
+BOOST_AUTO_TEST_CASE( PasteFindsLibrarySymbolInDestination )
+{
+    SCHEMATIC*     model = loadSchematic( wxS( "api_kitchen_sink" ) );
+    SCH_SHEET_PATH root = model->Hierarchy().at( 0 );
+    SCH_SYMBOL*    symbol = nullptr;
+
+    for( SCH_ITEM* item : root.LastScreen()->Items().OfType( SCH_SYMBOL_T ) )
+    {
+        symbol = static_cast<SCH_SYMBOL*>( item );
+        break;
+    }
+
+    BOOST_REQUIRE( symbol );
+
+    // Only the symbol, without the (lib_symbols) section the editor adds for it
+    std::string text = formatItems( *model, root, { symbol } );
+    size_t      start = text.find( "(lib_symbols" );
+    BOOST_REQUIRE( start != std::string::npos );
+
+    int depth = 0;
+    size_t end = start;
+
+    for( ; end < text.size(); ++end )
+    {
+        depth += text[end] == '(' ? 1 : text[end] == ')' ? -1 : 0;
+
+        if( depth == 0 )
+            break;
+    }
+
+    text.erase( start, end - start + 1 );
+
+    const size_t    before = root.LastScreen()->Items().size();
+    API_HANDLER_SCH handler( m_context );
+    API_RESULT      result = paste( handler, *model, text, VECTOR2I( 0, 0 ) );
+
+    // The destination screen knows the symbol, so it still pastes; a symbol it does not know
+    // would be refused
+    BOOST_REQUIRE( result.has_value() );
+    kiapi::common::commands::CreateItemsResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+    BOOST_REQUIRE_EQUAL( response.created_items_size(), 1 );
+    BOOST_CHECK_EQUAL( response.created_items( 0 ).status().code(), kiapi::common::commands::ItemStatusCode::ISC_OK );
+    BOOST_CHECK_EQUAL( root.LastScreen()->Items().size(), before + 1 );
+
+    // A symbol that neither the text nor the destination defines is refused
+    size_t idPos = text.find( "(lib_id \"" );
+    BOOST_REQUIRE( idPos != std::string::npos );
+    size_t nameEnd = text.find( '"', idPos + 9 );
+    text.replace( idPos + 9, nameEnd - idPos - 9, "Nowhere:Missing" );
+
+    result = paste( handler, *model, text, VECTOR2I( 0, 0 ) );
+    BOOST_REQUIRE( result.has_value() );
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+    BOOST_REQUIRE_EQUAL( response.created_items_size(), 1 );
+    BOOST_CHECK_EQUAL( response.created_items( 0 ).status().code(),
+                       kiapi::common::commands::ItemStatusCode::ISC_INVALID_DATA );
+    BOOST_CHECK_EQUAL( root.LastScreen()->Items().size(), before + 1 );
+}
+
+
+BOOST_AUTO_TEST_CASE( PasteDropsRefusedMembersFromGroups )
+{
+    SCHEMATIC*     model = loadSchematic( wxS( "api_kitchen_sink" ) );
+    SCH_SHEET_PATH root = model->Hierarchy().at( 0 );
+    SCH_SCREEN*    screen = root.LastScreen();
+    SCH_GROUP*     group = nullptr;
+    SCH_SYMBOL*    symbol = nullptr;
+
+    for( SCH_ITEM* item : screen->Items().OfType( SCH_GROUP_T ) )
+        group = static_cast<SCH_GROUP*>( item );
+
+    for( SCH_ITEM* item : screen->Items().OfType( SCH_SYMBOL_T ) )
+    {
+        symbol = static_cast<SCH_SYMBOL*>( item );
+        break;
+    }
+
+    BOOST_REQUIRE( group && symbol );
+
+    std::vector<SCH_ITEM*> source = { group, symbol };
+
+    for( EDA_ITEM* member : group->GetItems() )
+        source.push_back( static_cast<SCH_ITEM*>( member ) );
+
+    // The symbol joins the group in the text, but refers to a library symbol nobody has
+    std::string text = formatItems( *model, root, source );
+    size_t      start = text.find( "(lib_symbols" );
+    BOOST_REQUIRE( start != std::string::npos );
+
+    int    depth = 0;
+    size_t end = start;
+
+    for( ; end < text.size(); ++end )
+    {
+        depth += text[end] == '(' ? 1 : text[end] == ')' ? -1 : 0;
+
+        if( depth == 0 )
+            break;
+    }
+
+    text.erase( start, end - start + 1 );
+
+    size_t idPos = text.find( "(lib_id \"" );
+    BOOST_REQUIRE( idPos != std::string::npos );
+    text.replace( idPos + 9, text.find( '"', idPos + 9 ) - idPos - 9, "Nowhere:Missing" );
+
+    size_t membersPos = text.find( "(members " );
+    BOOST_REQUIRE( membersPos != std::string::npos );
+    text.insert( membersPos + 9, "\"" + symbol->m_Uuid.AsStdString() + "\" " );
+
+    const VECTOR2I  offset( schIUScale.MilsToIU( 3000 ), schIUScale.MilsToIU( 1000 ) );
+    std::set<KIID>  idsBefore = allIds( *model );
+    API_HANDLER_SCH handler( m_context );
+    API_RESULT      result = paste( handler, *model, text, offset );
+
+    BOOST_REQUIRE( result.has_value() );
+    kiapi::common::commands::CreateItemsResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+
+    int refused = 0;
+
+    for( const kiapi::common::commands::ItemCreationResult& created : response.created_items() )
+    {
+        if( created.status().code() == kiapi::common::commands::ItemStatusCode::ISC_INVALID_DATA )
+            refused++;
+    }
+
+    BOOST_CHECK_EQUAL( refused, 1 );
+
+    SCH_GROUP* pasted = nullptr;
+
+    for( SCH_ITEM* item : screen->Items().OfType( SCH_GROUP_T ) )
+    {
+        if( !idsBefore.contains( item->m_Uuid ) )
+            pasted = static_cast<SCH_GROUP*>( item );
+    }
+
+    // The group keeps the members that were pasted and moves them with it
+    BOOST_REQUIRE( pasted );
+    BOOST_CHECK_EQUAL( pasted->GetItems().size(), group->GetItems().size() );
+    BOOST_CHECK_EQUAL( pasted->GetBoundingBox().GetPosition(), group->GetBoundingBox().GetPosition() + offset );
+}
+
+
+BOOST_AUTO_TEST_CASE( PasteSheetSharesBaseReferencesInSuffixMode )
+{
+    SCHEMATIC*     model = loadSchematic( wxS( "api_kitchen_sink" ) );
+    SCH_SHEET_PATH root = model->Hierarchy().at( 0 );
+    SCH_SHEET*     sheet = nullptr;
+
+    for( SCH_ITEM* item : root.LastScreen()->Items().OfType( SCH_SHEET_T ) )
+    {
+        sheet = static_cast<SCH_SHEET*>( item );
+        break;
+    }
+
+    BOOST_REQUIRE( sheet && sheet->GetScreen() );
+
+    model->Settings().m_AnnotateReusedSheetSuffixes = true;
+    model->Settings().m_IncrementPastedSuffix = true;
+    sheet->GetField( FIELD_T::SHEET_REF_SUFFIX )->SetText( wxS( "A" ) );
+
+    SCH_SCREEN*       subScreen = sheet->GetScreen();
+    const std::string text = formatItems( *model, root, { sheet } );
+
+    API_HANDLER_SCH handler( m_context );
+    API_RESULT      result = paste( handler, *model, text, VECTOR2I( 0, schIUScale.MilsToIU( 2000 ) ) );
+
+    BOOST_REQUIRE( result.has_value() );
+    BOOST_REQUIRE_EQUAL( result->status().status(), kiapi::common::ApiStatusCode::AS_OK );
+
+    SCH_SHEET_LIST paths = model->Hierarchy().FindAllSheetsForScreen( subScreen );
+    BOOST_REQUIRE_EQUAL( paths.size(), 2 );
+
+    // Both instances of the reused sheet number their symbols from one base, told apart by the suffix
+    for( SCH_ITEM* item : subScreen->Items().OfType( SCH_SYMBOL_T ) )
+    {
+        SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+
+        if( symbol->IsPower() )
+            continue;
+
+        BOOST_CHECK_EQUAL( symbol->GetBaseRef( &paths[0] ), symbol->GetBaseRef( &paths[1] ) );
+        BOOST_CHECK_NE( symbol->GetRef( &paths[0], false ), symbol->GetRef( &paths[1], false ) );
+    }
+
+    // A copy of one of its symbols pasted into the reused sheet takes a new base, the same for both
+    SCH_SYMBOL* original = nullptr;
+
+    for( SCH_ITEM* item : subScreen->Items().OfType( SCH_SYMBOL_T ) )
+    {
+        if( !static_cast<SCH_SYMBOL*>( item )->IsPower() )
+            original = static_cast<SCH_SYMBOL*>( item );
+    }
+
+    BOOST_REQUIRE( original );
+
+    std::set<KIID> idsBefore = allIds( *model );
+    result = paste( handler, *model, formatItems( *model, paths[0], { original } ),
+                    VECTOR2I( schIUScale.MilsToIU( 1000 ), 0 ), &paths[0] );
+    BOOST_REQUIRE( result.has_value() );
+
+    SCH_SYMBOL* copy = nullptr;
+
+    for( SCH_ITEM* item : subScreen->Items().OfType( SCH_SYMBOL_T ) )
+    {
+        if( !idsBefore.contains( item->m_Uuid ) )
+            copy = static_cast<SCH_SYMBOL*>( item );
+    }
+
+    BOOST_REQUIRE( copy );
+    BOOST_CHECK_NE( copy->GetBaseRef( &paths[0] ), original->GetBaseRef( &paths[0] ) );
+    BOOST_CHECK_EQUAL( copy->GetBaseRef( &paths[0] ), copy->GetBaseRef( &paths[1] ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( PasteIntoSubsheet )
+{
+    SCHEMATIC*      model = loadSchematic( wxS( "api_kitchen_sink" ) );
+    SCH_SHEET_LIST  hierarchy = model->Hierarchy();
+    SCH_SHEET_PATH* sub = nullptr;
+
+    for( SCH_SHEET_PATH& path : hierarchy )
+    {
+        if( path.size() > 1 )
+            sub = &path;
+    }
+
+    BOOST_REQUIRE( sub );
+
+    SCH_SHEET_PATH root = hierarchy.at( 0 );
+    SCH_LABEL_BASE* label = nullptr;
+
+    for( SCH_ITEM* item : root.LastScreen()->Items() )
+    {
+        if( item->Type() == SCH_LABEL_T )
+        {
+            label = static_cast<SCH_LABEL_BASE*>( item );
+            break;
+        }
+    }
+
+    BOOST_REQUIRE( label );
+
+    const std::string text = formatItems( *model, root, { label } );
+    const size_t      rootBefore = root.LastScreen()->Items().size();
+    const size_t      subBefore = sub->LastScreen()->Items().size();
+
+    API_HANDLER_SCH handler( m_context );
+    API_RESULT      result = paste( handler, *model, text, VECTOR2I( 0, 0 ), sub );
+
+    BOOST_REQUIRE( result.has_value() );
+    BOOST_CHECK_EQUAL( root.LastScreen()->Items().size(), rootBefore );
+    BOOST_CHECK_EQUAL( sub->LastScreen()->Items().size(), subBefore + 1 );
+}
+
+
+BOOST_AUTO_TEST_CASE( PasteSheetReusesScreen )
+{
+    SCHEMATIC*     model = loadSchematic( wxS( "api_kitchen_sink" ) );
+    SCH_SHEET_PATH root = model->Hierarchy().at( 0 );
+    SCH_SHEET*     sheet = nullptr;
+
+    for( SCH_ITEM* item : root.LastScreen()->Items().OfType( SCH_SHEET_T ) )
+    {
+        sheet = static_cast<SCH_SHEET*>( item );
+        break;
+    }
+
+    BOOST_REQUIRE( sheet );
+
+    SCH_SCREEN* subScreen = sheet->GetScreen();
+    BOOST_REQUIRE( subScreen );
+
+    const std::string text = formatItems( *model, root, { sheet } );
+    const size_t      sheetsBefore = model->Hierarchy().size();
+    std::set<KIID>    idsBefore = allIds( *model );
+
+    API_HANDLER_SCH handler( m_context );
+    API_RESULT      result = paste( handler, *model, text, VECTOR2I( 0, schIUScale.MilsToIU( 2000 ) ) );
+
+    BOOST_REQUIRE( result.has_value() );
+    BOOST_REQUIRE_EQUAL( result->status().status(), kiapi::common::ApiStatusCode::AS_OK );
+
+    kiapi::common::commands::CreateItemsResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+    BOOST_REQUIRE_EQUAL( response.created_items_size(), 1 );
+    BOOST_REQUIRE_EQUAL( response.created_items( 0 ).status().code(), kiapi::common::commands::ItemStatusCode::ISC_OK );
+
+    SCH_SHEET* pasted = nullptr;
+
+    for( SCH_ITEM* item : root.LastScreen()->Items().OfType( SCH_SHEET_T ) )
+    {
+        if( !idsBefore.contains( item->m_Uuid ) )
+            pasted = static_cast<SCH_SHEET*>( item );
+    }
+
+    BOOST_REQUIRE( pasted );
+    BOOST_CHECK( pasted->GetScreen() == subScreen );
+    BOOST_CHECK_NE( pasted->GetName(), sheet->GetName() );
+
+    // The sheet is a second instance of the same file
+    BOOST_CHECK_EQUAL( model->Hierarchy().size(), sheetsBefore + 1 );
+
+    for( const SCH_SHEET_PATH& path : model->Hierarchy().FindAllSheetsForScreen( subScreen ) )
+    {
+        for( SCH_ITEM* item : subScreen->Items().OfType( SCH_SYMBOL_T ) )
+        {
+            SCH_SYMBOL*         symbol = static_cast<SCH_SYMBOL*>( item );
+            SCH_SYMBOL_INSTANCE instance;
+
+            BOOST_CHECK_MESSAGE( symbol->GetInstance( instance, path.Path() ),
+                                 "symbol without an instance for " << path.PathAsString() );
+        }
+    }
+}
+
+
+BOOST_AUTO_TEST_CASE( PasteSheetWithFileOutsideHierarchyIsRejected )
+{
+    SCHEMATIC*     model = loadSchematic( wxS( "api_kitchen_sink" ) );
+    SCH_SHEET_PATH root = model->Hierarchy().at( 0 );
+    SCH_SHEET*     sheet = nullptr;
+
+    for( SCH_ITEM* item : root.LastScreen()->Items().OfType( SCH_SHEET_T ) )
+    {
+        sheet = static_cast<SCH_SHEET*>( item );
+        break;
+    }
+
+    BOOST_REQUIRE( sheet );
+
+    // Points at a file that exists next to the schematic but is not part of it
+    std::string text = formatItems( *model, root, { sheet } );
+    size_t      pos = text.find( "erc_test_dynamic_power_symbol_subsheet.kicad_sch" );
+    BOOST_REQUIRE( pos != std::string::npos );
+    text.replace( pos, std::string( "erc_test_dynamic_power_symbol_subsheet.kicad_sch" ).size(),
+                  "erc_label_test.kicad_sch" );
+
+    const size_t sheetsBefore = model->Hierarchy().size();
+    const size_t itemsBefore = root.LastScreen()->Items().size();
+
+    API_HANDLER_SCH handler( m_context );
+    API_RESULT      result = paste( handler, *model, text, VECTOR2I( 0, 0 ) );
+
+    BOOST_REQUIRE( result.has_value() );
+
+    kiapi::common::commands::CreateItemsResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+    BOOST_REQUIRE_EQUAL( response.created_items_size(), 1 );
+    BOOST_CHECK_EQUAL( response.created_items( 0 ).status().code(),
+                       kiapi::common::commands::ItemStatusCode::ISC_INVALID_DATA );
+    BOOST_CHECK_EQUAL( root.LastScreen()->Items().size(), itemsBefore );
+    BOOST_CHECK_EQUAL( model->Hierarchy().size(), sheetsBefore );
 }
 
 

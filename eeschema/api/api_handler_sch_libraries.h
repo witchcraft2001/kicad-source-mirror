@@ -36,6 +36,11 @@ protected:
 
     std::vector<wxString> getItemNames( LIBRARY_MANAGER_ADAPTER& aAdapter,
                                         const wxString& aNickname ) const override;
+
+    std::vector<LIB_TREE_ITEM*> getSearchItems( LIBRARY_MANAGER_ADAPTER& aAdapter,
+                                                const wxString&          aNickname ) const override;
+
+    bool supportsSearch() const override { return true; }
 };
 
 #endif //KICAD_API_HANDLER_SCH_LIBRARIES_H

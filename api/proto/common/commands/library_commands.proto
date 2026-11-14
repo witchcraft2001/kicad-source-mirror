@@ -47,7 +47,8 @@ message GetLibraryTable
   // Which type of table (symbol, footprint, design block) to query
   kiapi.common.types.LibraryType type = 1;
 
-  // Which table scope (global, project, or both)
+  // Which table scope (global, project, or both).  With LTS_BOTH the rows are the ones in effect:
+  // a project row replaces a global row of the same nickname.
   kiapi.common.types.LibraryTableScope scope = 2;
 
   // If true, return URIs with environment variables expanded
@@ -196,15 +197,52 @@ message SearchLibraries
   kiapi.common.types.LibraryType type = 1;
 
   // Glob pattern or substring to match against item names.  Follows the same logic
-  // of KiCad's library chooser filter
+  // of KiCad's library chooser filter: whitespace-separated terms that all have to match
+  // the name, description, keywords or library, ranked the way the chooser ranks them.
   string query = 2;
+
+  // Nicknames of the libraries to search.  If empty, all enabled libraries that are not hidden
+  // are searched.  Since: 11.0
+  repeated string libraries = 3;
+
+  // Return at most this many of the best matches; 0 means no limit.  Since: 11.0
+  int32 max_results = 4;
 }
 
+// One match of SearchLibraries
+// Since: 11.0
+message LibrarySearchResult
+{
+  kiapi.common.types.LibraryIdentifier id = 1;
+
+  string description = 2;
+
+  // Pins of a symbol, or the unique pads of a footprint
+  int32 pin_count = 3;
+
+  // Units of a symbol; 1 for items without units
+  int32 unit_count = 4;
+
+  // The footprint field of a symbol
+  string footprint = 5;
+
+  // How well the item matches the query; higher is better
+  int32 score = 6;
+
+  // True if a query term equals the name of the item or one of its other search terms
+  bool exact_match = 7;
+}
+
+// Returns the matches best first.  If the libraries of the type are still loading the command
+// fails with AS_NOT_READY and can be repeated.
 // Since: 11.0
 message SearchLibrariesResponse
 {
   // The identifiers of matching content
   repeated kiapi.common.types.LibraryIdentifier items = 1;
+
+  // The same matches in the same order, with the details the chooser shows.  Since: 11.0
+  repeated LibrarySearchResult results = 2;
 }
 
 // Since: 11.0

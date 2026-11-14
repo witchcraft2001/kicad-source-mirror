@@ -495,9 +495,17 @@ message SavedSelectionResponse
 // similar to how the Paste action inside the KiCad editor works.  If the parse is successful,
 // the items will be created and inserted into the editor.
 // Returns CreateItemsResponse
+//
+// The schematic editor accepts the text SaveSelectionToString returns, or a sequence of
+// top-level items taken from a schematic file together with the lib_symbols they use.  Items
+// get new identifiers, and references that already exist are renumbered.  Contents that cannot
+// be parsed are refused with AS_BAD_REQUEST and change nothing.
 message ParseAndCreateItemsFromString
 {
   kiapi.common.types.DocumentSpecifier document = 1;
 
   string contents = 2;
+
+  // Added to the position of every created item.  Since: 11.0
+  kiapi.common.types.Vector2 offset = 3;
 }

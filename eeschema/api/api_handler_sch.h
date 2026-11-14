@@ -133,6 +133,9 @@ private:
     HANDLER_RESULT<commands::GetItemsResponse>
     handleGetItemsById( const HANDLER_CONTEXT<commands::GetItemsById>& aCtx );
 
+    HANDLER_RESULT<commands::GetBoundingBoxResponse>
+    handleGetBoundingBox( const HANDLER_CONTEXT<commands::GetBoundingBox>& aCtx );
+
     HANDLER_RESULT<commands::SelectionResponse>
     handleGetSelection( const HANDLER_CONTEXT<commands::GetSelection>& aCtx );
 
