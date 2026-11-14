@@ -35,8 +35,10 @@
 #include <drc/drc_exclusion.h>
 #include <drc/drc_item.h>
 #include <drc/drc_rule.h>
+#include <footprint.h>
 #include <pad.h>
 #include <pcb_marker.h>
+#include <pcb_generator.h>
 #include <pcb_track.h>
 #include <settings/settings_manager.h>
 #include <zone.h>
@@ -259,6 +261,83 @@ kiapi::common::ApiRequest makeQueryConstraintRequest( BOARD* aBoard, kiapi::boar
     BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
 
     return request;
+}
+
+
+kiapi::common::ApiRequest packRequest( const google::protobuf::Message& aCommand )
+{
+    kiapi::common::ApiRequest request;
+    request.mutable_header()->set_client_name( "kicad.qa" );
+    BOOST_REQUIRE( request.mutable_message()->PackFrom( aCommand ) );
+
+    return request;
+}
+
+
+/// A tuning pattern with every setting filled, as a client must send it
+kiapi::board::types::TuningPattern makeTuningPattern( kiapi::board::types::TuningPatternMode aMode,
+                                                      const VECTOR2I& aOrigin, const VECTOR2I& aEnd,
+                                                      int aSpacingNm )
+{
+    using namespace kiapi::board::types;
+
+    TuningPattern pattern;
+    pattern.set_layer( BoardLayer::BL_F_Cu );
+    pattern.mutable_origin()->set_x_nm( aOrigin.x );
+    pattern.mutable_origin()->set_y_nm( aOrigin.y );
+    pattern.mutable_end()->set_x_nm( aEnd.x );
+    pattern.mutable_end()->set_y_nm( aEnd.y );
+    pattern.set_mode( aMode );
+    pattern.set_target_mode( TuningPatternTargetMode::TPTM_LENGTH );
+    pattern.set_override_custom_rules( true );
+
+    TuningPatternSettings* settings = pattern.mutable_settings();
+    settings->set_initial_side( TuningPatternMeanderSide::TPMS_DEFAULT );
+    settings->set_corner_style( TuningPatternCornerStyle::TPCS_ROUNDED );
+    settings->set_corner_radius_percent( 80 );
+    settings->mutable_min_amplitude()->set_value_nm( pcbIUScale.mmToIU( 0.2 ) );
+    settings->mutable_max_amplitude()->set_value_nm( pcbIUScale.mmToIU( 1.5 ) );
+    settings->mutable_min_spacing()->set_value_nm( aSpacingNm );
+
+    return pattern;
+}
+
+
+/// Create one item through the API and return its creation result
+kiapi::common::commands::ItemCreationResult createItem( API_HANDLER_PCB& aHandler, const BOARD& aBoard,
+                                                        const google::protobuf::Message& aItem )
+{
+    kiapi::common::commands::CreateItems command;
+    *command.mutable_header()->mutable_document() = makeBoardDocument( aBoard );
+    command.add_items()->PackFrom( aItem );
+
+    kiapi::common::ApiRequest request = packRequest( command );
+    API_RESULT                result = aHandler.Handle( request );
+
+    BOOST_REQUIRE( result.has_value() );
+    BOOST_REQUIRE_EQUAL( result->status().status(), kiapi::common::ApiStatusCode::AS_OK );
+
+    kiapi::common::commands::CreateItemsResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+    BOOST_REQUIRE_EQUAL( response.created_items_size(), 1 );
+
+    return response.created_items( 0 );
+}
+
+
+/// Routed length of a net from pad to pad, as GetNetLengths reports it
+int64_t netLength( API_HANDLER_PCB& aHandler, BOARD* aBoard, const std::string& aNet )
+{
+    kiapi::common::ApiRequest request = makeNetLengthsRequest( aBoard, { aNet }, false );
+    API_RESULT                result = aHandler.Handle( request );
+
+    BOOST_REQUIRE( result.has_value() );
+
+    kiapi::board::commands::NetLengthsResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+    BOOST_REQUIRE_EQUAL( response.nets_size(), 1 );
+
+    return response.nets( 0 ).total_length().value_nm();
 }
 
 } // namespace
@@ -1277,5 +1356,287 @@ BOOST_AUTO_TEST_CASE( RouteConnectionRejectsNonCopperItems )
     BOOST_CHECK_EQUAL( result.error().status(), kiapi::common::ApiStatusCode::AS_BAD_REQUEST );
 }
 
+
+BOOST_AUTO_TEST_CASE( RouteConnectionChangesLayerWithVia )
+{
+    BOARD* board = loadBoard( wxS( "issue5830" ) );
+
+    unfillAll( board );
+    board->BuildConnectivity();
+
+    std::shared_ptr<CONNECTIVITY_DATA> connectivity = board->GetConnectivity();
+    const unsigned                     before = connectivity->GetUnconnectedCount( false );
+
+    PAD* from = nullptr;
+    PAD* to = nullptr;
+
+    // The longest ratsnest line between two front pads leaves room for two layer changes
+    double longest = 0;
+
+    connectivity->RunOnUnconnectedEdges(
+            [&]( CN_EDGE& aEdge )
+            {
+                auto* a = dynamic_cast<PAD*>( aEdge.GetSourceNode()->Parent() );
+                auto* b = dynamic_cast<PAD*>( aEdge.GetTargetNode()->Parent() );
+
+                if( a && b && a->IsOnLayer( F_Cu ) && b->IsOnLayer( F_Cu )
+                    && ( a->GetPosition() - b->GetPosition() ).EuclideanNorm() > longest )
+                {
+                    longest = ( a->GetPosition() - b->GetPosition() ).EuclideanNorm();
+                    from = a;
+                    to = b;
+                }
+
+                return true;
+            } );
+
+    BOOST_REQUIRE( from && to );
+
+    const VECTOR2I delta = to->GetPosition() - from->GetPosition();
+    const VECTOR2I first = from->GetPosition() + delta / 3;
+    const VECTOR2I second = from->GetPosition() + delta * 2 / 3;
+
+    kiapi::board::commands::RouteConnection command;
+    *command.mutable_board() = makeBoardDocument( *board );
+    command.mutable_start_item()->set_value( from->m_Uuid.AsStdString() );
+    command.mutable_end_item()->set_value( to->m_Uuid.AsStdString() );
+    command.set_layer( kiapi::board::types::BoardLayer::BL_F_Cu );
+    command.set_mode( kiapi::board::commands::RouterMode::RTM_SINGLE );
+    command.set_collision_mode( kiapi::board::commands::RouterCollisionMode::RCM_WALKAROUND );
+
+    kiapi::board::commands::RouteWaypoint* down = command.add_route_waypoints();
+    down->mutable_position()->set_x_nm( first.x );
+    down->mutable_position()->set_y_nm( first.y );
+    down->set_layer( kiapi::board::types::BoardLayer::BL_B_Cu );
+
+    kiapi::board::commands::RouteWaypoint* up = command.add_route_waypoints();
+    up->mutable_position()->set_x_nm( second.x );
+    up->mutable_position()->set_y_nm( second.y );
+    up->set_layer( kiapi::board::types::BoardLayer::BL_F_Cu );
+
+    command.mutable_via_diameter()->set_value_nm( pcbIUScale.mmToIU( 0.6 ) );
+    command.mutable_via_drill()->set_value_nm( pcbIUScale.mmToIU( 0.3 ) );
+
+    API_HANDLER_PCB           handler( m_context );
+    kiapi::common::ApiRequest request = packRequest( command );
+    API_RESULT                result = handler.Handle( request );
+
+    BOOST_REQUIRE( result.has_value() );
+    BOOST_REQUIRE_EQUAL( result->status().status(), kiapi::common::ApiStatusCode::AS_OK );
+
+    kiapi::board::commands::RouteConnectionResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+    BOOST_REQUIRE_MESSAGE( response.success(), response.failure_reason() );
+
+    int  vias = 0;
+    bool front = false;
+    bool back = false;
+
+    for( const google::protobuf::Any& any : response.created_items() )
+    {
+        kiapi::board::types::Via via;
+        kiapi::board::types::Track track;
+
+        if( any.UnpackTo( &via ) )
+        {
+            vias++;
+            BOOST_CHECK_EQUAL( via.pad_stack().drill().diameter().x_nm(), pcbIUScale.mmToIU( 0.3 ) );
+        }
+        else if( any.UnpackTo( &track ) )
+        {
+            front |= track.layer() == kiapi::board::types::BoardLayer::BL_F_Cu;
+            back |= track.layer() == kiapi::board::types::BoardLayer::BL_B_Cu;
+        }
+    }
+
+    BOOST_CHECK_EQUAL( vias, 2 );
+    BOOST_CHECK( front );
+    BOOST_CHECK( back );
+
+    connectivity->RecalculateRatsnest();
+    BOOST_CHECK_LT( connectivity->GetUnconnectedCount( false ), before );
+}
+
+
+BOOST_AUTO_TEST_CASE( RouteConnectionRejectsMixedWaypoints )
+{
+    BOARD* board = loadBoard( wxS( "issue5830" ) );
+
+    PAD* pad = nullptr;
+
+    for( FOOTPRINT* footprint : board->Footprints() )
+    {
+        if( !footprint->Pads().empty() )
+        {
+            pad = footprint->Pads().front();
+            break;
+        }
+    }
+
+    BOOST_REQUIRE( pad );
+
+    kiapi::board::commands::RouteConnection command;
+    *command.mutable_board() = makeBoardDocument( *board );
+    command.mutable_start_item()->set_value( pad->m_Uuid.AsStdString() );
+    command.mutable_end_item()->set_value( pad->m_Uuid.AsStdString() );
+    command.add_waypoints()->set_x_nm( 0 );
+    command.add_route_waypoints()->mutable_position()->set_x_nm( 0 );
+
+    API_HANDLER_PCB           handler( m_context );
+    kiapi::common::ApiRequest request = packRequest( command );
+    API_RESULT                result = handler.Handle( request );
+
+    BOOST_REQUIRE( !result.has_value() );
+    BOOST_CHECK_EQUAL( result.error().status(), kiapi::common::ApiStatusCode::AS_BAD_REQUEST );
+}
+
+BOOST_AUTO_TEST_CASE( CreateTuningPatternTunesSingleTrack )
+{
+    using namespace kiapi::board::types;
+
+    BOARD* board = loadBoard( wxS( "length_calculations" ) );
+
+    API_HANDLER_PCB   handler( m_context );
+    const std::string net = "Net-(R1-Pad2)";
+    const int64_t     before = netLength( handler, board, net );
+    const int64_t     target = before + pcbIUScale.mmToIU( 5 );
+    const int64_t     tolerance = pcbIUScale.mmToIU( 0.1 );
+
+    // The net is one straight F.Cu segment from (122.301, 48.895) to (135.636, 48.895)
+    TuningPattern pattern = makeTuningPattern( TuningPatternMode::TPM_SINGLE,
+                                               VECTOR2I( pcbIUScale.mmToIU( 124 ), pcbIUScale.mmToIU( 48.895 ) ),
+                                               VECTOR2I( pcbIUScale.mmToIU( 134 ), pcbIUScale.mmToIU( 48.895 ) ),
+                                               pcbIUScale.mmToIU( 0.6 ) );
+    pattern.mutable_target_length()->set_min( target - tolerance );
+    pattern.mutable_target_length()->set_opt( target );
+    pattern.mutable_target_length()->set_max( target + tolerance );
+
+    kiapi::common::commands::ItemCreationResult created = createItem( handler, *board, pattern );
+    BOOST_REQUIRE_MESSAGE( created.status().code() == kiapi::common::commands::ItemStatusCode::ISC_OK,
+                           created.status().error_message() );
+
+    TuningPattern result;
+    BOOST_REQUIRE( created.item().UnpackTo( &result ) );
+
+    BOOST_CHECK_EQUAL( result.state().status(), TuningPatternStatus::TPS_TUNED );
+    BOOST_CHECK( result.members_size() > 0 );
+    BOOST_CHECK_EQUAL( board->Generators().size(), 1 );
+
+    const int64_t after = netLength( handler, board, net );
+    BOOST_CHECK_LE( std::abs( after - target ), tolerance );
+}
+
+
+BOOST_AUTO_TEST_CASE( CreateTuningPatternTunesDiffPair )
+{
+    using namespace kiapi::board::types;
+
+    BOARD* board = loadBoard( wxS( "diff_pair_uncoupled_tuning_drc" ) );
+
+    API_HANDLER_PCB handler( m_context );
+    const int64_t   p = netLength( handler, board, "/DIFF_P" );
+    const int64_t   n = netLength( handler, board, "/DIFF_N" );
+    const int64_t   target = std::max( p, n ) + pcbIUScale.mmToIU( 3 );
+    const int64_t   tolerance = pcbIUScale.mmToIU( 0.1 );
+
+    // /DIFF_P and /DIFF_N run coupled and straight on F.Cu from x = 136.24 mm to 154.33 mm
+    TuningPattern pattern = makeTuningPattern( TuningPatternMode::TPM_DIFF_PAIR,
+                                               VECTOR2I( pcbIUScale.mmToIU( 139 ), pcbIUScale.mmToIU( 93.275 ) ),
+                                               VECTOR2I( pcbIUScale.mmToIU( 152 ), pcbIUScale.mmToIU( 93.275 ) ),
+                                               pcbIUScale.mmToIU( 1.0 ) );
+    pattern.mutable_target_length()->set_min( target - tolerance );
+    pattern.mutable_target_length()->set_opt( target );
+    pattern.mutable_target_length()->set_max( target + tolerance );
+
+    kiapi::common::commands::ItemCreationResult created = createItem( handler, *board, pattern );
+    BOOST_REQUIRE_MESSAGE( created.status().code() == kiapi::common::commands::ItemStatusCode::ISC_OK,
+                           created.status().error_message() );
+
+    TuningPattern result;
+    BOOST_REQUIRE( created.item().UnpackTo( &result ) );
+
+    BOOST_CHECK_EQUAL( result.state().status(), TuningPatternStatus::TPS_TUNED );
+    BOOST_CHECK( result.members_size() > 0 );
+
+    // Both legs are meandered together, so both get longer
+    BOOST_CHECK_GT( netLength( handler, board, "/DIFF_P" ), p );
+    BOOST_CHECK_GT( netLength( handler, board, "/DIFF_N" ), n );
+    BOOST_CHECK_LE( std::abs( std::max( netLength( handler, board, "/DIFF_P" ),
+                                        netLength( handler, board, "/DIFF_N" ) ) - target ),
+                    tolerance );
+}
+
+
+BOOST_AUTO_TEST_CASE( CreateTuningPatternSetsSkew )
+{
+    using namespace kiapi::board::types;
+
+    BOARD* board = loadBoard( wxS( "diff_pair_uncoupled_tuning_drc" ) );
+
+    API_HANDLER_PCB handler( m_context );
+    const int64_t   n = netLength( handler, board, "/DIFF_N" );
+
+    // Make /DIFF_N 1 mm longer than /DIFF_P by meandering its coupled stretch only
+    const int64_t skew = pcbIUScale.mmToIU( 1 );
+    const int64_t tolerance = pcbIUScale.mmToIU( 0.05 );
+
+    TuningPattern pattern = makeTuningPattern( TuningPatternMode::TPM_DIFF_PAIR_SKEW,
+                                               VECTOR2I( pcbIUScale.mmToIU( 139 ), pcbIUScale.mmToIU( 93.275 ) ),
+                                               VECTOR2I( pcbIUScale.mmToIU( 152 ), pcbIUScale.mmToIU( 93.275 ) ),
+                                               pcbIUScale.mmToIU( 1.0 ) );
+    pattern.mutable_target_skew()->set_min( skew - tolerance );
+    pattern.mutable_target_skew()->set_opt( skew );
+    pattern.mutable_target_skew()->set_max( skew + tolerance );
+
+    kiapi::common::commands::ItemCreationResult created = createItem( handler, *board, pattern );
+    BOOST_REQUIRE_MESSAGE( created.status().code() == kiapi::common::commands::ItemStatusCode::ISC_OK,
+                           created.status().error_message() );
+
+    TuningPattern result;
+    BOOST_REQUIRE( created.item().UnpackTo( &result ) );
+
+    BOOST_CHECK_EQUAL( result.state().status(), TuningPatternStatus::TPS_TUNED );
+    BOOST_CHECK( result.members_size() > 0 );
+    BOOST_CHECK_GT( netLength( handler, board, "/DIFF_N" ), n );
+}
+
+
+BOOST_AUTO_TEST_CASE( DeleteTuningPatternRestoresBaseline )
+{
+    using namespace kiapi::board::types;
+
+    BOARD* board = loadBoard( wxS( "length_calculations" ) );
+
+    API_HANDLER_PCB   handler( m_context );
+    const std::string net = "Net-(R1-Pad2)";
+    const int64_t     before = netLength( handler, board, net );
+    const size_t      tracksBefore = board->Tracks().size();
+
+    TuningPattern pattern = makeTuningPattern( TuningPatternMode::TPM_SINGLE,
+                                               VECTOR2I( pcbIUScale.mmToIU( 124 ), pcbIUScale.mmToIU( 48.895 ) ),
+                                               VECTOR2I( pcbIUScale.mmToIU( 134 ), pcbIUScale.mmToIU( 48.895 ) ),
+                                               pcbIUScale.mmToIU( 0.6 ) );
+    pattern.mutable_target_length()->set_opt( before + pcbIUScale.mmToIU( 4 ) );
+
+    kiapi::common::commands::ItemCreationResult created = createItem( handler, *board, pattern );
+    BOOST_REQUIRE( created.status().code() == kiapi::common::commands::ItemStatusCode::ISC_OK );
+    BOOST_REQUIRE_GT( netLength( handler, board, net ), before );
+
+    TuningPattern result;
+    BOOST_REQUIRE( created.item().UnpackTo( &result ) );
+
+    kiapi::common::commands::DeleteItems command;
+    *command.mutable_header()->mutable_document() = makeBoardDocument( *board );
+    *command.add_item_ids() = result.id();
+
+    kiapi::common::ApiRequest deleteRequest = packRequest( command );
+    API_RESULT                deleted = handler.Handle( deleteRequest );
+    BOOST_REQUIRE( deleted.has_value() );
+    BOOST_REQUIRE_EQUAL( deleted->status().status(), kiapi::common::ApiStatusCode::AS_OK );
+
+    BOOST_CHECK( board->Generators().empty() );
+    BOOST_CHECK_LE( std::abs( netLength( handler, board, net ) - before ), pcbIUScale.mmToIU( 0.001 ) );
+    BOOST_CHECK_LE( board->Tracks().size(), tracksBefore + 2 );
+}
 
 BOOST_AUTO_TEST_SUITE_END()

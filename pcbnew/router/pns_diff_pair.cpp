@@ -1238,9 +1238,18 @@ void DIFF_PAIR::CoupledSegmentPairs( COUPLED_SEGMENTS_VEC& aPairs,
     gapConstraint.SetMax( (int) ( (double)m_dims.Width() * threshold ) );
  
     if ( aOverrideGapConstraint )
+    {
         gapConstraint = aOverrideGapConstraint.value();
+    }
     else if( aUseGapConstraint )
+    {
         gapConstraint = m_dims.GapConstraint();
+
+        // Pairs assembled from existing tracks (length tuning, DRC) carry no gap constraint;
+        // couple the segments that run at the pair's own gap
+        if( gapConstraint.IsNull() )
+            gapConstraint.SetOpt( m_dims.Gap() );
+    }
     
     double opt = gapConstraint.Opt();
 

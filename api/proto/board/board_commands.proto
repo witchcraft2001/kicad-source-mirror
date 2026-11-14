@@ -445,6 +445,16 @@ enum RouterCollisionMode
   RCM_MARK_OBSTACLES = 3;   // allow collisions; they are reported by DRC
 }
 
+// A point the router passes through.  When layer is set and differs from the layer being routed,
+// the router places a via at the point and continues on that layer, as if the user switched
+// layers there.  Layer changes need the walkaround or shove collision mode.
+// Since: 11.0
+message RouteWaypoint
+{
+  kiapi.common.types.Vector2 position = 1;
+  optional kiapi.board.types.BoardLayer layer = 2;
+}
+
 // Routes a connection with the interactive push-and-shove router, as if a user started at
 // start_item, clicked each waypoint and finished on end_item.  Clearances, widths and
 // differential-pair gaps come from the design rules unless overridden.  The routed items are
@@ -479,6 +489,17 @@ message RouteConnection
   // Overrides for the rule-derived sizes
   optional kiapi.common.types.Distance track_width = 10;
   optional kiapi.common.types.Distance diff_pair_gap = 11;
+
+  // Waypoints that may change layers.  Use either these or waypoints, not both.
+  repeated RouteWaypoint route_waypoints = 12;
+
+  // Type of the vias placed at layer changes; defaults to through vias.  Blind, buried and micro
+  // vias between the two outer layers are placed as through vias.
+  optional kiapi.board.types.ViaType via_type = 13;
+
+  // Overrides for the rule-derived via sizes
+  optional kiapi.common.types.Distance via_diameter = 14;
+  optional kiapi.common.types.Distance via_drill = 15;
 }
 
 // Since: 11.0

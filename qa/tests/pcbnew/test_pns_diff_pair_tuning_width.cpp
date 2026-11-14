@@ -90,6 +90,42 @@ BOOST_FIXTURE_TEST_CASE( DiffPairTuningStopsAtTrackWidthChanges, DIFF_PAIR_TUNIN
 }
 
 
+// Length tuning assembles the pair from existing tracks, so the pair carries no gap constraint.
+// Its coupled segments must still be found at the pair's own gap.
+BOOST_FIXTURE_TEST_CASE( AssembledDiffPairHasCoupledSegments, DIFF_PAIR_TUNING_WIDTH_FIXTURE )
+{
+    KI_TEST::LoadBoard( m_settingsManager, "issue23550/issue23550", m_board );
+    BOOST_REQUIRE( m_board );
+
+    PCB_TRACK& startTrack = static_cast<PCB_TRACK&>( KI_TEST::RequireBoardItemWithTypeAndId(
+            *m_board, PCB_TRACE_T, KIID( "5ca809fb-b7f4-4a3c-b239-272a2b12320f" ) ) );
+
+    PNS::ROUTING_SETTINGS settings( nullptr, "" );
+    PNS::ROUTER           router;
+    PNS_KICAD_IFACE_BASE  iface;
+
+    iface.SetBoard( m_board.get() );
+    router.SetInterface( &iface );
+    router.ClearWorld();
+    router.SyncWorld();
+    router.LoadSettings( &settings );
+
+    PNS::ITEM* startItem = router.GetWorld()->FindItemByParent( &startTrack );
+    BOOST_REQUIRE( startItem );
+
+    PNS::DIFF_PAIR pair;
+    PNS::TOPOLOGY  topology( router.GetWorld() );
+
+    BOOST_REQUIRE( topology.AssembleDiffPair( startItem, pair ) );
+    BOOST_REQUIRE( pair.Dimensions().Gap() > 0 );
+
+    PNS::DIFF_PAIR::COUPLED_SEGMENTS_VEC coupled;
+    pair.CoupledSegmentPairs( coupled );
+
+    BOOST_CHECK( !coupled.empty() );
+}
+
+
 // Picking an inner target layer for a via sets a partial layer pair. A through via still has
 // to span the whole board, or its annular ring stops being drawn below the target layer.
 BOOST_FIXTURE_TEST_CASE( DiffPairThroughViaSpansFullStack, DIFF_PAIR_TUNING_WIDTH_FIXTURE )

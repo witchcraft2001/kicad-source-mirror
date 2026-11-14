@@ -2088,6 +2088,9 @@ HANDLER_RESULT<RouteConnectionResponse> API_HANDLER_PCB::handleRouteConnection(
                 return tl::unexpected( e );
             };
 
+    if( !aCtx.Request.waypoints().empty() && !aCtx.Request.route_waypoints().empty() )
+        return badRequest( "use either waypoints or route_waypoints, not both" );
+
     std::optional<BOARD_ITEM*> startBoardItem = getItemById( KIID( aCtx.Request.start_item().value() ) );
     std::optional<BOARD_ITEM*> endBoardItem = getItemById( KIID( aCtx.Request.end_item().value() ) );
 
@@ -2192,7 +2195,36 @@ HANDLER_RESULT<RouteConnectionResponse> API_HANDLER_PCB::handleRouteConnection(
     if( aCtx.Request.has_diff_pair_gap() )
         sizes.SetDiffPairGap( static_cast<int>( aCtx.Request.diff_pair_gap().value_nm() ) );
 
+    // Without a layer pair the router falls back to board layer IDs for the via span
+    sizes.ClearLayerPairs();
+    sizes.AddLayerPair( iface.GetPNSLayerFromBoardLayer( F_Cu ), iface.GetPNSLayerFromBoardLayer( B_Cu ) );
+
     router.UpdateSizes( sizes );
+
+    VIATYPE viaType = VIATYPE::THROUGH;
+
+    if( aCtx.Request.has_via_type() && aCtx.Request.via_type() != board::types::ViaType::VT_UNKNOWN )
+        viaType = FromProtoEnum<VIATYPE, board::types::ViaType>( aCtx.Request.via_type() );
+
+    std::vector<std::pair<VECTOR2I, std::optional<PCB_LAYER_ID>>> waypoints;
+
+    for( const types::Vector2& waypoint : aCtx.Request.waypoints() )
+        waypoints.emplace_back( UnpackVector2( waypoint ), std::nullopt );
+
+    for( const RouteWaypoint& waypoint : aCtx.Request.route_waypoints() )
+    {
+        std::optional<PCB_LAYER_ID> waypointLayer;
+
+        if( waypoint.has_layer() )
+        {
+            waypointLayer = FromProtoEnum<PCB_LAYER_ID, board::types::BoardLayer>( waypoint.layer() );
+
+            if( !IsCopperLayer( *waypointLayer ) || !board()->IsLayerEnabled( *waypointLayer ) )
+                return badRequest( "waypoint layers must be enabled copper layers" );
+        }
+
+        waypoints.emplace_back( UnpackVector2( waypoint.position() ), waypointLayer );
+    }
 
     RouteConnectionResponse response;
 
@@ -2203,11 +2235,123 @@ HANDLER_RESULT<RouteConnectionResponse> API_HANDLER_PCB::handleRouteConnection(
         return response;
     }
 
-    for( const types::Vector2& waypoint : aCtx.Request.waypoints() )
+    // Via sizes follow ROUTER_TOOL::handleLayerSwitch: the rules for a via of this type and span,
+    // the netclass via or the board's current via size
+    auto viaSizes =
+            [&]( PNS::SIZES_SETTINGS& aSizes, VIATYPE aType, PCB_LAYER_ID aFrom, PCB_LAYER_ID aTo )
+            {
+                BOARD_DESIGN_SETTINGS& bds = board()->GetDesignSettings();
+
+                aSizes.SetViaDiameter( bds.m_ViasMinSize );
+                aSizes.SetViaDrill( bds.m_MinThroughDrill );
+
+                if( bds.UseNetClassVia() || aType == VIATYPE::MICROVIA )
+                {
+                    PCB_VIA dummyVia( board() );
+                    dummyVia.SetViaType( aType );
+                    dummyVia.SetLayerPair( aFrom, aTo );
+
+                    if( !router.GetCurrentNets().empty() )
+                        dummyVia.SetNet( static_cast<NETINFO_ITEM*>( router.GetCurrentNets()[0] ) );
+
+                    DRC_CONSTRAINT constraint = bds.m_DRCEngine->EvalRules( VIA_DIAMETER_CONSTRAINT, &dummyVia,
+                                                                            nullptr, aFrom );
+
+                    if( !constraint.IsNull() )
+                        aSizes.SetViaDiameter( constraint.m_Value.PinnedOpt() );
+
+                    constraint = bds.m_DRCEngine->EvalRules( HOLE_SIZE_CONSTRAINT, &dummyVia, nullptr, aFrom );
+
+                    if( !constraint.IsNull() )
+                        aSizes.SetViaDrill( constraint.m_Value.PinnedOpt() );
+                }
+                else
+                {
+                    aSizes.SetViaDiameter( bds.GetCurrentViaSize() );
+                    aSizes.SetViaDrill( bds.GetCurrentViaDrill() );
+                }
+
+                if( aCtx.Request.has_via_diameter() )
+                    aSizes.SetViaDiameter( static_cast<int>( aCtx.Request.via_diameter().value_nm() ) );
+
+                if( aCtx.Request.has_via_drill() )
+                    aSizes.SetViaDrill( static_cast<int>( aCtx.Request.via_drill().value_nm() ) );
+            };
+
+    PCB_LAYER_ID currentLayer = layer;
+
+    for( const auto& [point, waypointLayer] : waypoints )
     {
-        VECTOR2I point = UnpackVector2( waypoint );
+        if( !waypointLayer || *waypointLayer == currentLayer )
+        {
+            router.Move( point, nullptr );
+            router.FixRoute( point, nullptr, false, false );
+            continue;
+        }
+
+        PCB_LAYER_ID targetLayer = *waypointLayer;
+        VIATYPE      type = viaType;
+
+        if( type != VIATYPE::THROUGH
+                && ( ( currentLayer == F_Cu && targetLayer == B_Cu )
+                     || ( currentLayer == B_Cu && targetLayer == F_Cu ) ) )
+        {
+            type = VIATYPE::THROUGH;
+        }
+
+        PNS::SIZES_SETTINGS viaSettings( router.Sizes() );
+        viaSizes( viaSettings, type, currentLayer, targetLayer );
+        viaSettings.SetViaType( type );
+        viaSettings.ClearLayerPairs();
+        viaSettings.AddLayerPair( iface.GetPNSLayerFromBoardLayer( currentLayer ),
+                                  iface.GetPNSLayerFromBoardLayer( targetLayer ) );
+        router.UpdateSizes( viaSettings );
+
+        if( !router.IsPlacingVia() )
+            router.ToggleViaPlacement();
+
         router.Move( point, nullptr );
         router.FixRoute( point, nullptr, false, false );
+
+        if( !router.SwitchLayer( iface.GetPNSLayerFromBoardLayer( targetLayer ) ) )
+        {
+            router.StopRouting();
+
+            RouteConnectionResponse failed;
+            failed.set_success( false );
+            // The mark-obstacles mode merges the via into the fixed trace and cannot change layers
+            failed.set_failure_reason( fmt::format( "could not continue on layer {} after the via at "
+                                                    "({}, {}) nm; layer changes need the walkaround or "
+                                                    "shove collision mode",
+                                                    board()->GetLayerName( targetLayer ).ToStdString(), point.x,
+                                                    point.y ) );
+            return failed;
+        }
+
+        currentLayer = targetLayer;
+
+        // Widths and clearances can differ per layer; keep the caller's overrides
+        PNS::SIZES_SETTINGS layerSizes( router.Sizes() );
+        iface.SetStartLayerFromPCBNew( currentLayer );
+        iface.ImportSizes( layerSizes, startItem, nullptr, point );
+
+        if( aCtx.Request.has_track_width() )
+        {
+            int width = static_cast<int>( aCtx.Request.track_width().value_nm() );
+            layerSizes.SetTrackWidth( width );
+            layerSizes.SetTrackWidthIsExplicit( true );
+            layerSizes.SetDiffPairWidth( width );
+        }
+
+        if( aCtx.Request.has_diff_pair_gap() )
+            layerSizes.SetDiffPairGap( static_cast<int>( aCtx.Request.diff_pair_gap().value_nm() ) );
+
+        layerSizes.SetViaType( type );
+        layerSizes.SetViaDiameter( viaSettings.ViaDiameter() );
+        layerSizes.SetViaDrill( viaSettings.ViaDrill() );
+        layerSizes.ClearLayerPairs();
+        layerSizes.AddLayerPair( iface.GetPNSLayerFromBoardLayer( F_Cu ), iface.GetPNSLayerFromBoardLayer( B_Cu ) );
+        router.UpdateSizes( layerSizes );
     }
 
     router.Move( *end, endItem );
