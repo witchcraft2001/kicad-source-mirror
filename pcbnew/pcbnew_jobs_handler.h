@@ -21,6 +21,8 @@
 #ifndef PCBNEW_JOBS_HANDLER_H
 #define PCBNEW_JOBS_HANDLER_H
 
+#include <functional>
+
 #include <jobs/job_dispatcher.h>
 #include <pcb_plot_params.h>
 #include <diff_merge/diff_doc_kind.h>
@@ -112,6 +114,16 @@ public:
      */
     void ClearCachedBoard();
 
+    /**
+     * Run the jobs on a board's file on that board when it is open elsewhere (in the API server),
+     * instead of on a copy loaded from the file: a copy misses the changes made since the file was
+     * saved or since the copy was loaded.
+     *
+     * @param aProvider returns the open board (null while none is open); the board is not owned and
+     *                  may be replaced, for example by a revert.
+     */
+    void SetOpenBoard( std::function<BOARD*()> aProvider ) { m_openBoard = std::move( aProvider ); }
+
 private:
     BOARD* getBoard( const wxString& aPath = wxEmptyString );
     void refillFabZones( const JOB_EXPORT_PCB_FAB& aJob, BOARD* aBoard );
@@ -136,6 +148,7 @@ private:
 
     std::unique_ptr<BOARD> m_cliBoard;
     std::unique_ptr<TOOL_MANAGER> m_toolManager;
+    std::function<BOARD*()> m_openBoard;
 };
 
 #endif

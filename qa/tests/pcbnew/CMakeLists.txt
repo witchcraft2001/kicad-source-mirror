@@ -153,6 +153,7 @@ set( QA_PCBNEW_SRCS
     test_netlist_group_instances.cpp
     test_step_export_modified_board.cpp
     test_pdf_output_path.cpp
+    test_job_open_board.cpp
     test_shape_corner_radius.cpp
     test_shape_hatch_knockout.cpp
     test_connect_board_shapes.cpp

@@ -603,10 +603,27 @@ BOARD* PCBNEW_JOBS_HANDLER::getBoard( const wxString& aPath )
             pcbPath = path.GetFullPath();
         }
 
-        if( !m_cliBoard )
-            m_cliBoard.reset( loadBoardFromPath( pcbPath ) );
+        // The board the API server has open holds changes the file does not
+        BOARD* open = m_openBoard ? m_openBoard() : nullptr;
 
-        brd = m_cliBoard.get();
+        if( open )
+        {
+            wxFileName openFile( open->GetFileName() );
+            wxFileName wanted( pcbPath );
+            openFile.MakeAbsolute();
+            wanted.MakeAbsolute();
+
+            if( openFile.SameAs( wanted ) )
+                brd = open;
+        }
+
+        if( !brd )
+        {
+            if( !m_cliBoard )
+                m_cliBoard.reset( loadBoardFromPath( pcbPath ) );
+
+            brd = m_cliBoard.get();
+        }
     }
     else if( Pgm().IsGUI() && Pgm().GetSettingsManager().IsProjectOpen() )
     {
