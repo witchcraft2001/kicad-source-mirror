@@ -28,6 +28,7 @@
 #include <pcbnew_utils/board_test_utils.h>
 
 #include <board.h>
+#include <board_design_settings.h>
 #include <board_connected_item.h>
 #include <connectivity/connectivity_algo.h>
 #include <connectivity/connectivity_data.h>
@@ -40,11 +41,14 @@
 #include <pcb_marker.h>
 #include <pcb_generator.h>
 #include <pcb_track.h>
+#include <pgm_base.h>
 #include <settings/settings_manager.h>
 #include <zone.h>
 #include <zone_filler.h>
 
+#include <api/api_handler_common.h>
 #include <api/api_handler_pcb.h>
+#include <api/api_pcb_utils.h>
 #include <api/api_task_scheduler.h>
 #include <api/headless_pcb_context.h>
 #include <api/board/board_commands.pb.h>
@@ -52,6 +56,7 @@
 #include <api/board/board_tasks.pb.h>
 #include <api/board/board_types.pb.h>
 #include <api/common/commands/editor_commands.pb.h>
+#include <api/common/commands/project_commands.pb.h>
 #include <api/common/envelope.pb.h>
 #include <api/common/tasks.pb.h>
 #include <api/common/types/base_types.pb.h>
@@ -1637,6 +1642,320 @@ BOOST_AUTO_TEST_CASE( DeleteTuningPatternRestoresBaseline )
     BOOST_CHECK( board->Generators().empty() );
     BOOST_CHECK_LE( std::abs( netLength( handler, board, net ) - before ), pcbIUScale.mmToIU( 0.001 ) );
     BOOST_CHECK_LE( board->Tracks().size(), tracksBefore + 2 );
+}
+
+
+/// Send UpdateBoardStackup and return the handler result
+API_RESULT updateStackup( API_HANDLER_PCB& aHandler, const BOARD& aBoard,
+                          const kiapi::board::BoardStackup& aStackup )
+{
+    kiapi::board::commands::UpdateBoardStackup command;
+    *command.mutable_board() = makeBoardDocument( aBoard );
+    *command.mutable_stackup() = aStackup;
+
+    kiapi::common::ApiRequest request = packRequest( command );
+    return aHandler.Handle( request );
+}
+
+
+/// Copper layers of the board's stackup descriptor, top to bottom
+std::vector<PCB_LAYER_ID> stackupCopper( BOARD* aBoard )
+{
+    std::vector<PCB_LAYER_ID> layers;
+
+    for( BOARD_STACKUP_ITEM* item : aBoard->GetDesignSettings().GetStackupDescriptor().GetList() )
+    {
+        if( item->GetType() == BS_ITEM_TYPE_COPPER )
+            layers.push_back( item->GetBrdLayerId() );
+    }
+
+    return layers;
+}
+
+
+BOOST_AUTO_TEST_CASE( UpdateBoardStackupRoundTrip )
+{
+    using namespace kiapi::board;
+
+    BOARD* board = loadBoard( wxS( "issue5830" ) );
+    BOOST_REQUIRE_EQUAL( board->GetCopperLayerCount(), 4 );
+
+    BoardStackup stackup;
+    board::PackBoardStackup( *board, stackup );
+
+    BoardStackupLayer* dielectric = nullptr;
+    BoardStackupLayer* mask = nullptr;
+
+    for( BoardStackupLayer& layer : *stackup.mutable_layers() )
+    {
+        if( !dielectric && layer.type() == BoardStackupLayerType::BSLT_DIELECTRIC )
+            dielectric = &layer;
+
+        if( !mask && layer.type() == BoardStackupLayerType::BSLT_SOLDERMASK )
+            mask = &layer;
+    }
+
+    BOOST_REQUIRE( dielectric && dielectric->dielectric().layer_size() > 0 );
+    BOOST_REQUIRE( mask );
+
+    const int thickness = pcbIUScale.mmToIU( 0.3 );
+    BoardStackupDielectricProperties* props = dielectric->mutable_dielectric()->mutable_layer( 0 );
+    const int oldThickness = static_cast<int>( props->thickness().value_nm() );
+    props->mutable_thickness()->set_value_nm( thickness );
+    props->set_epsilon_r( 3.8 );
+    props->set_loss_tangent( 0.008 );
+    props->set_material_name( "QA laminate" );
+    mask->mutable_soldermask()->set_material_name( "QA mask" );
+    stackup.mutable_impedance()->set_is_controlled( true );
+
+    const int boardBefore = board->GetDesignSettings().GetBoardThickness();
+
+    API_HANDLER_PCB handler( m_context );
+    API_RESULT      result = updateStackup( handler, *board, stackup );
+    BOOST_REQUIRE( result.has_value() );
+
+    kiapi::board::commands::BoardStackupResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+
+    const BOARD_DESIGN_SETTINGS& bds = board->GetDesignSettings();
+    BOOST_CHECK( bds.m_HasStackup );
+    BOOST_CHECK( bds.GetStackupDescriptor().m_HasDielectricConstrains );
+    BOOST_CHECK_EQUAL( bds.GetBoardThickness(), boardBefore + thickness - oldThickness );
+    BOOST_CHECK_EQUAL( bds.GetBoardThickness(), bds.GetStackupDescriptor().BuildBoardThicknessFromStackup() );
+
+    const BOARD_STACKUP_ITEM* firstDielectric = nullptr;
+    const BOARD_STACKUP_ITEM* firstMask = nullptr;
+
+    for( const BOARD_STACKUP_ITEM* item : bds.GetStackupDescriptor().GetList() )
+    {
+        if( !firstDielectric && item->GetType() == BS_ITEM_TYPE_DIELECTRIC )
+            firstDielectric = item;
+
+        if( !firstMask && item->GetType() == BS_ITEM_TYPE_SOLDERMASK )
+            firstMask = item;
+    }
+
+    BOOST_REQUIRE( firstDielectric && firstMask );
+    BOOST_CHECK_EQUAL( firstDielectric->GetThickness( 0 ), thickness );
+    BOOST_CHECK_CLOSE( firstDielectric->GetEpsilonR( 0 ), 3.8, 1e-9 );
+    BOOST_CHECK_CLOSE( firstDielectric->GetLossTangent( 0 ), 0.008, 1e-9 );
+    BOOST_CHECK( firstDielectric->GetMaterial( 0 ) == wxS( "QA laminate" ) );
+    BOOST_CHECK( firstMask->GetMaterial( 0 ) == wxS( "QA mask" ) );
+
+    // The response is the stackup as stored, so sending it back changes nothing
+    BoardStackup echoed = response.stackup();
+    result = updateStackup( handler, *board, echoed );
+    BOOST_REQUIRE( result.has_value() );
+
+    kiapi::board::commands::BoardStackupResponse second;
+    BOOST_REQUIRE( result->message().UnpackTo( &second ) );
+    BOOST_CHECK_EQUAL( second.stackup().SerializeAsString(), echoed.SerializeAsString() );
+}
+
+
+BOOST_AUTO_TEST_CASE( UpdateBoardStackupRejectsCopperMismatch )
+{
+    using namespace kiapi::board;
+
+    BOARD* board = loadBoard( wxS( "issue5830" ) );
+
+    BoardStackup stackup;
+    board::PackBoardStackup( *board, stackup );
+    const std::string before = stackup.SerializeAsString();
+
+    // Renaming In2.Cu to In3.Cu no longer matches the board's copper layers
+    BoardStackup renamed = stackup;
+
+    for( BoardStackupLayer& layer : *renamed.mutable_layers() )
+    {
+        if( layer.layer() == kiapi::board::types::BoardLayer::BL_In2_Cu )
+            layer.set_layer( kiapi::board::types::BoardLayer::BL_In3_Cu );
+    }
+
+    API_HANDLER_PCB handler( m_context );
+    API_RESULT      result = updateStackup( handler, *board, renamed );
+    BOOST_REQUIRE( !result.has_value() );
+    BOOST_CHECK_EQUAL( result.error().status(), kiapi::common::ApiStatusCode::AS_BAD_REQUEST );
+
+    // Two copper layers with no dielectric between them are not a stackup
+    BoardStackup noDielectric = stackup;
+    auto*        layers = noDielectric.mutable_layers();
+
+    for( int i = 0; i < layers->size(); ++i )
+    {
+        if( layers->Get( i ).type() == BoardStackupLayerType::BSLT_DIELECTRIC )
+        {
+            layers->DeleteSubrange( i, 1 );
+            break;
+        }
+    }
+
+    result = updateStackup( handler, *board, noDielectric );
+    BOOST_REQUIRE( !result.has_value() );
+    BOOST_CHECK_EQUAL( result.error().status(), kiapi::common::ApiStatusCode::AS_BAD_REQUEST );
+
+    BoardStackup after;
+    board::PackBoardStackup( *board, after );
+    BOOST_CHECK_EQUAL( after.SerializeAsString(), before );
+}
+
+
+BOOST_AUTO_TEST_CASE( SetBoardEnabledLayersResyncsStackup )
+{
+    BOARD* board = loadBoard( wxS( "issue5830" ) );
+
+    API_HANDLER_PCB handler( m_context );
+
+    // Store the current stackup so the board has an explicit one
+    kiapi::board::BoardStackup stackup;
+    board::PackBoardStackup( *board, stackup );
+    BOOST_REQUIRE( updateStackup( handler, *board, stackup ).has_value() );
+    BOOST_REQUIRE_EQUAL( stackupCopper( board ).size(), 4 );
+
+    kiapi::board::commands::SetBoardEnabledLayers command;
+    *command.mutable_board() = makeBoardDocument( *board );
+    command.set_copper_layer_count( 6 );
+    board::PackLayerSet( *command.mutable_layers(), board->GetEnabledLayers() );
+
+    kiapi::common::ApiRequest request = packRequest( command );
+    API_RESULT                result = handler.Handle( request );
+    BOOST_REQUIRE( result.has_value() );
+
+    std::vector<PCB_LAYER_ID> copper = stackupCopper( board );
+    BOOST_REQUIRE_EQUAL( copper.size(), 6 );
+    BOOST_CHECK( copper.front() == F_Cu );
+    BOOST_CHECK( copper.back() == B_Cu );
+
+    const BOARD_DESIGN_SETTINGS& bds = board->GetDesignSettings();
+    BOOST_CHECK_EQUAL( bds.GetBoardThickness(), bds.GetStackupDescriptor().BuildBoardThicknessFromStackup() );
+}
+
+
+/// Track delay of every net with a routed length, by net name
+std::map<std::string, int64_t> trackDelays( API_HANDLER_PCB& aHandler, BOARD* aBoard )
+{
+    kiapi::common::ApiRequest request = makeNetLengthsRequest( aBoard, {}, true );
+    API_RESULT                result = aHandler.Handle( request );
+    BOOST_REQUIRE( result.has_value() );
+
+    kiapi::board::commands::NetLengthsResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+
+    std::map<std::string, int64_t> delays;
+
+    for( const kiapi::board::commands::NetLength& net : response.nets() )
+    {
+        if( net.track_length().value_nm() > 0 )
+            delays[net.net().name()] = net.track_delay().value_as();
+    }
+
+    return delays;
+}
+
+
+kiapi::common::commands::TuningProfilesResponse getTuningProfiles( API_HANDLER_COMMON& aHandler )
+{
+    kiapi::common::commands::GetTuningProfiles command;
+    kiapi::common::ApiRequest                  request = packRequest( command );
+    API_RESULT                                 result = aHandler.Handle( request );
+    BOOST_REQUIRE( result.has_value() );
+
+    kiapi::common::commands::TuningProfilesResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+    return response;
+}
+
+
+API_RESULT setTuningProfiles( API_HANDLER_COMMON& aHandler,
+                              const google::protobuf::RepeatedPtrField<kiapi::common::project::TuningProfile>& aProfiles )
+{
+    kiapi::common::commands::SetTuningProfiles command;
+    *command.mutable_profiles() = aProfiles;
+    command.set_merge_mode( kiapi::common::types::MapMergeMode::MMM_MERGE );
+
+    kiapi::common::ApiRequest request = packRequest( command );
+    return aHandler.Handle( request );
+}
+
+
+BOOST_AUTO_TEST_CASE( SetTuningProfilesChangesNetDelays )
+{
+    using namespace kiapi::common::project;
+
+    // The common handler reads the project of the global settings manager
+    KI_TEST::LoadBoard( Pgm().GetSettingsManager(), wxS( "time_calculations" ), m_board );
+    BOARD* board = m_board.get();
+    m_context = std::make_shared<HEADLESS_PCB_CONTEXT>( std::move( m_board ),
+                                                        &Pgm().GetSettingsManager().Prj(), nullptr );
+
+    API_HANDLER_COMMON common;
+    API_HANDLER_PCB    pcb( m_context );
+
+    kiapi::common::commands::TuningProfilesResponse before = getTuningProfiles( common );
+    BOOST_REQUIRE_EQUAL( before.profiles_size(), 7 );
+
+    const TuningProfile& class1 = before.profiles( 0 );
+    BOOST_CHECK_EQUAL( class1.name(), "CLASS1" );
+    BOOST_CHECK( class1.type() == TuningProfileType::TPT_SINGLE );
+    BOOST_CHECK( class1.enable_time_domain_tuning() );
+    BOOST_REQUIRE( class1.layers_size() > 0 );
+    BOOST_CHECK( class1.layers( 0 ).signal_layer() == kiapi::board::types::BoardLayer::BL_F_Cu );
+    BOOST_CHECK_EQUAL( class1.layers( 0 ).delay_per_mm(), 1000000 );
+
+    std::map<std::string, int64_t> delaysBefore = trackDelays( pcb, board );
+    int                            withDelay = 0;
+
+    for( const auto& [name, delay] : delaysBefore )
+        withDelay += delay > 0;
+
+    BOOST_REQUIRE( withDelay > 0 );
+
+    // Doubling every track delay doubles the track delay of every net
+    google::protobuf::RepeatedPtrField<TuningProfile> doubled = before.profiles();
+
+    for( TuningProfile& profile : doubled )
+    {
+        for( TuningProfileLayer& layer : *profile.mutable_layers() )
+            layer.set_delay_per_mm( layer.delay_per_mm() * 2 );
+    }
+
+    BOOST_REQUIRE( setTuningProfiles( common, doubled ).has_value() );
+    BOOST_REQUIRE( common.clearNetSettingsNotification() );
+    static_cast<API_HANDLER&>( pcb ).onNetSettingsChanged();
+
+    std::map<std::string, int64_t> delaysAfter = trackDelays( pcb, board );
+
+    for( const auto& [name, delay] : delaysBefore )
+    {
+        BOOST_TEST_CONTEXT( name )
+        {
+            BOOST_CHECK_LE( std::abs( delaysAfter[name] - 2 * delay ), 2 );
+        }
+    }
+
+    kiapi::common::commands::TuningProfilesResponse after = getTuningProfiles( common );
+    BOOST_REQUIRE_EQUAL( after.profiles_size(), 7 );
+    BOOST_CHECK_EQUAL( after.profiles( 0 ).layers( 0 ).delay_per_mm(), 2000000 );
+
+    // Invalid requests leave the profiles alone
+    google::protobuf::RepeatedPtrField<TuningProfile> duplicateName;
+    *duplicateName.Add() = after.profiles( 0 );
+    *duplicateName.Add() = after.profiles( 0 );
+    API_RESULT result = setTuningProfiles( common, duplicateName );
+    BOOST_REQUIRE( !result.has_value() );
+    BOOST_CHECK_EQUAL( result.error().status(), kiapi::common::ApiStatusCode::AS_BAD_REQUEST );
+
+    google::protobuf::RepeatedPtrField<TuningProfile> duplicateLayer;
+    TuningProfile* bad = duplicateLayer.Add();
+    *bad = after.profiles( 0 );
+    *bad->add_layers() = bad->layers( 0 );
+    BOOST_CHECK( !setTuningProfiles( common, duplicateLayer ).has_value() );
+
+    bad->mutable_layers()->RemoveLast();
+    bad->mutable_layers( 0 )->set_signal_layer( kiapi::board::types::BoardLayer::BL_F_SilkS );
+    BOOST_CHECK( !setTuningProfiles( common, duplicateLayer ).has_value() );
+
+    BOOST_CHECK_EQUAL( getTuningProfiles( common ).SerializeAsString(), after.SerializeAsString() );
 }
 
 BOOST_AUTO_TEST_SUITE_END()

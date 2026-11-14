@@ -115,3 +115,70 @@ message TextVariables
 {
   map<string, string> variables = 1;
 }
+
+enum TuningProfileType
+{
+  TPT_UNKNOWN      = 0;
+  TPT_SINGLE       = 1;
+  TPT_DIFFERENTIAL = 2;
+}
+
+// The geometry and propagation delay of one signal layer in a tuning profile
+message TuningProfileLayer
+{
+  kiapi.board.types.BoardLayer signal_layer = 1;
+
+  // The reference planes above and below the signal layer; BL_UNDEFINED for none
+  kiapi.board.types.BoardLayer top_reference_layer = 2;
+  kiapi.board.types.BoardLayer bottom_reference_layer = 3;
+
+  // Track width giving the target impedance; zero leaves the width to the netclass and rules
+  kiapi.common.types.Distance width = 4;
+
+  // Gap giving the target differential impedance (differential profiles only)
+  kiapi.common.types.Distance diff_pair_gap = 5;
+
+  // Propagation delay of a track on this layer, in attoseconds per millimetre
+  // (1 ps/mm = 1000000)
+  int64 delay_per_mm = 6;
+}
+
+// The propagation delay of a via between two signal layers, replacing the profile default
+message TuningProfileViaOverride
+{
+  kiapi.board.types.BoardLayer signal_layer_from = 1;
+  kiapi.board.types.BoardLayer signal_layer_to = 2;
+  kiapi.board.types.BoardLayer via_layer_from = 3;
+  kiapi.board.types.BoardLayer via_layer_to = 4;
+  kiapi.common.types.Time delay = 5;
+}
+
+// A tuning profile (Board Setup > Tuning Profiles): the per-layer track geometry for a target
+// impedance and the propagation delays used for time domain length tuning.  Assign a profile to a
+// netclass with NetClassBoardSettings.tuning_profile.
+// Since: 11.0
+message TuningProfile
+{
+  string name = 1;
+  TuningProfileType type = 2;
+
+  // Target impedance in ohms (differential impedance for differential profiles)
+  double target_impedance = 3;
+
+  // Frequency in hertz at which the impedance and delay were calculated
+  double frequency = 4;
+
+  // When false, delays are not used and tuning works on lengths only
+  bool enable_time_domain_tuning = 5;
+  bool model_solder_mask = 6;
+
+  repeated TuningProfileLayer layers = 7;
+
+  // Default propagation delay through vias, in attoseconds per millimetre of via length
+  int64 via_delay_per_mm = 8;
+
+  repeated TuningProfileViaOverride via_overrides = 9;
+
+  // Propagation delay of net chain bridges, in attoseconds per millimetre
+  int64 net_chain_bridge_delay_per_mm = 10;
+}

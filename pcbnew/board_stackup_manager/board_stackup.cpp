@@ -579,7 +579,6 @@ void BOARD_STACKUP::Serialize( google::protobuf::Any& aContainer ) const
 
 bool BOARD_STACKUP::Deserialize( const google::protobuf::Any& aContainer )
 {
-    // Read-only for now
     kiapi::board::BoardStackup stackup;
 
     if( !aContainer.UnpackTo( &stackup ) )
@@ -591,8 +590,178 @@ bool BOARD_STACKUP::Deserialize( const google::protobuf::Any& aContainer )
 
 bool BOARD_STACKUP::Deserialize( const kiapi::board::BoardStackup& aInput )
 {
-    // Read-only for now
-    return false;
+    using namespace kiapi::board;
+
+    std::vector<std::unique_ptr<BOARD_STACKUP_ITEM>> items;
+    int  dielectricIdx = 0;
+    bool seenCopper = false;
+    bool pendingDielectric = false;     // a dielectric that is not yet closed by a copper layer
+    bool betweenCopper = true;          // a dielectric has been seen since the last copper layer
+
+    for( const BoardStackupLayer& layer : aInput.layers() )
+    {
+        BOARD_STACKUP_ITEM_TYPE type = FromProtoEnum<BOARD_STACKUP_ITEM_TYPE>( layer.type() );
+
+        if( type == BS_ITEM_TYPE_UNDEFINED )
+            return false;
+
+        auto item = std::make_unique<BOARD_STACKUP_ITEM>( type );
+        item->SetEnabled( layer.enabled() );
+
+        if( layer.thickness().value_nm() < 0 )
+            return false;
+
+        if( type == BS_ITEM_TYPE_DIELECTRIC )
+        {
+            // Dielectrics only make sense between two copper layers
+            if( !seenCopper )
+                return false;
+
+            pendingDielectric = true;
+            betweenCopper = true;
+            item->SetDielectricLayerId( ++dielectricIdx );
+
+            const BoardStackupDielectricLayer& dielectric = layer.dielectric();
+
+            if( dielectric.type() == BoardStackupDielectricType::BSDT_PREPREG )
+                item->SetTypeName( KEY_PREPREG );
+            else
+                item->SetTypeName( KEY_CORE );
+
+            if( dielectric.layer_size() == 0 )
+            {
+                item->SetThickness( layer.thickness().value_nm() );
+
+                if( !layer.material_name().empty() )
+                    item->SetMaterial( wxString::FromUTF8( layer.material_name() ) );
+            }
+
+            for( int i = 0; i < dielectric.layer_size(); ++i )
+            {
+                const BoardStackupDielectricProperties& props = dielectric.layer( i );
+
+                if( props.thickness().value_nm() < 0 || props.epsilon_r() < 1.0
+                    || props.loss_tangent() < 0 )
+                {
+                    return false;
+                }
+
+                if( i > 0 )
+                    item->AddDielectricPrms( i );
+
+                item->SetThickness( props.thickness().value_nm(), i );
+                item->SetThicknessLocked( props.thickness_locked(), i );
+                item->SetEpsilonR( props.epsilon_r(), i );
+                item->SetLossTangent( props.loss_tangent(), i );
+
+                if( !props.material_name().empty() )
+                    item->SetMaterial( wxString::FromUTF8( props.material_name() ), i );
+
+                if( props.has_spec_frequency() )
+                    item->SetSpecFreq( props.spec_frequency(), i );
+
+                item->SetDielectricModel( FromProtoEnum<DIELECTRIC_MODEL>( props.dielectric_model() ), i );
+            }
+        }
+        else
+        {
+            PCB_LAYER_ID layerId = FromProtoEnum<PCB_LAYER_ID>( layer.layer() );
+
+            switch( type )
+            {
+            case BS_ITEM_TYPE_COPPER:
+                if( !IsCopperLayer( layerId ) || !betweenCopper )
+                    return false;
+
+                seenCopper = true;
+                pendingDielectric = false;
+                betweenCopper = false;
+                item->SetThickness( layer.thickness().value_nm() );
+                break;
+
+            case BS_ITEM_TYPE_SOLDERMASK:
+            {
+                if( layerId != F_Mask && layerId != B_Mask )
+                    return false;
+
+                item->SetTypeName( layerId == F_Mask ? _HKI( "Top Solder Mask" ) : _HKI( "Bottom Solder Mask" ) );
+
+                const BoardStackupSoldermaskLayer& mask = layer.soldermask();
+
+                if( layer.has_soldermask() )
+                {
+                    if( mask.thickness().value_nm() < 0 || mask.epsilon_r() < 1.0 || mask.loss_tangent() < 0 )
+                        return false;
+
+                    item->SetThickness( mask.thickness().value_nm() );
+                    item->SetEpsilonR( mask.epsilon_r() );
+                    item->SetLossTangent( mask.loss_tangent() );
+
+                    if( !mask.material_name().empty() )
+                        item->SetMaterial( wxString::FromUTF8( mask.material_name() ) );
+                }
+                else
+                {
+                    item->SetThickness( layer.thickness().value_nm() );
+                }
+
+                break;
+            }
+
+            case BS_ITEM_TYPE_SILKSCREEN:
+                if( layerId != F_SilkS && layerId != B_SilkS )
+                    return false;
+
+                item->SetTypeName( layerId == F_SilkS ? _HKI( "Top Silk Screen" ) : _HKI( "Bottom Silk Screen" ) );
+
+                if( layer.has_silkscreen() && !layer.silkscreen().material_name().empty() )
+                    item->SetMaterial( wxString::FromUTF8( layer.silkscreen().material_name() ) );
+
+                break;
+
+            case BS_ITEM_TYPE_SOLDERPASTE:
+                if( layerId != F_Paste && layerId != B_Paste )
+                    return false;
+
+                item->SetTypeName( layerId == F_Paste ? _HKI( "Top Solder Paste" ) : _HKI( "Bottom Solder Paste" ) );
+                break;
+
+            default:
+                return false;
+            }
+
+            item->SetBrdLayerId( layerId );
+        }
+
+        if( layer.has_color() && item->IsColorEditable() )
+            item->SetColor( kiapi::common::UnpackColor( layer.color() ).ToHexString() );
+
+        items.emplace_back( std::move( item ) );
+    }
+
+    // A stackup must start and end with copper (ignoring the technical layers)
+    if( !seenCopper || pendingDielectric )
+        return false;
+
+    RemoveAll();
+
+    for( std::unique_ptr<BOARD_STACKUP_ITEM>& item : items )
+        Add( item.release() );
+
+    if( aInput.has_finish() )
+        m_FinishType = wxString::FromUTF8( aInput.finish().type_name() );
+
+    if( aInput.has_impedance() )
+        m_HasDielectricConstrains = aInput.impedance().is_controlled();
+
+    if( aInput.has_edge() )
+    {
+        m_EdgeConnectorConstraints =
+                FromProtoEnum<BS_EDGE_CONNECTOR_CONSTRAINTS>( aInput.edge().connector().type() );
+        m_EdgePlating = aInput.edge().plating().has_edge_plating();
+    }
+
+    return true;
 }
 
 

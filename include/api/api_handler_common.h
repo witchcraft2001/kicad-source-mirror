@@ -90,6 +90,12 @@ private:
     HANDLER_RESULT<commands::NetClassAssignmentsResponse> handleGetNetClassAssignments(
         const HANDLER_CONTEXT<commands::GetNetClassAssignments>& aCtx );
 
+    HANDLER_RESULT<commands::TuningProfilesResponse> handleGetTuningProfiles(
+        const HANDLER_CONTEXT<commands::GetTuningProfiles>& aCtx );
+
+    HANDLER_RESULT<Empty> handleSetTuningProfiles(
+        const HANDLER_CONTEXT<commands::SetTuningProfiles>& aCtx );
+
     HANDLER_RESULT<Empty> handleSetNetClassAssignments(
         const HANDLER_CONTEXT<commands::SetNetClassAssignments>& aCtx );
 
@@ -127,6 +133,9 @@ private:
 
     HANDLER_RESULT<tasks::TaskStatusResponse> handleGetTaskStatus(
         const HANDLER_CONTEXT<tasks::GetTaskStatus>& aCtx );
+
+    HANDLER_RESULT<commands::TransmissionLineResponse> handleCalculateTransmissionLine(
+        const HANDLER_CONTEXT<commands::CalculateTransmissionLine>& aCtx );
 
 private:
     static tl::expected<bool, ApiResponseStatus> validateProject( const ProjectSpecifier& aProject,

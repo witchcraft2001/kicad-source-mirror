@@ -123,3 +123,135 @@ message GetPathsResponse
 {
   repeated PathEntry paths = 1;
 }
+
+// Transmission line models available to CalculateTransmissionLine
+enum TransmissionLineModel
+{
+  TLM_UNKNOWN            = 0;
+  TLM_MICROSTRIP         = 1;
+  TLM_COUPLED_MICROSTRIP = 2;
+  TLM_STRIPLINE          = 3;
+  TLM_COUPLED_STRIPLINE  = 4;
+  // Coplanar waveguide; set TLP_CPW_BACKMETAL to 1 for a grounded (backed) waveguide
+  TLM_COPLANAR           = 5;
+}
+
+// Inputs and outputs of the transmission line calculations, in SI units (metres, hertz, ohms,
+// siemens per metre) except where noted.  Each model accepts only the parameters it uses.
+enum TransmissionLineParameter
+{
+  TLP_UNKNOWN_ID            = 0;
+  TLP_EPSILONR              = 1;  // Relative permittivity of the substrate
+  TLP_TAND                  = 2;  // Loss tangent of the substrate
+  TLP_RHO                   = 3;  // Resistivity of the conductor (ohm metres); converted to TLP_SIGMA
+  TLP_H                     = 4;  // Substrate height (stripline: plane to plane)
+  TLP_H_T                   = 5;  // Height of the cover above the conductor (microstrip)
+  TLP_T                     = 6;  // Conductor thickness
+  TLP_PHYS_WIDTH            = 7;  // Trace width
+  TLP_PHYS_DIAM_IN          = 8;
+  TLP_PHYS_S                = 9;  // Gap between the traces of a pair, or between trace and ground
+  TLP_PHYS_DIAM_OUT         = 10;
+  TLP_PHYS_LEN              = 11; // Line length
+  TLP_ROUGH                 = 12; // Conductor surface roughness
+  TLP_MUR                   = 13; // Relative permeability of the substrate
+  TLP_MURC                  = 14; // Relative permeability of the conductor
+  TLP_FREQUENCY             = 15;
+  TLP_STRIPLINE_A           = 16; // Stripline: distance from the trace to the top plane
+  TLP_TWISTEDPAIR_TWIST     = 17;
+  TLP_TWISTEDPAIR_EPSILONR_ENV = 18;
+  TLP_Z0                    = 19; // Characteristic impedance
+  TLP_Z0_E                  = 20; // Even mode impedance
+  TLP_Z0_O                  = 21; // Odd mode impedance
+  TLP_ANG_L                 = 22; // Electrical length (radians)
+  TLP_DUMMY_PRM             = 23;
+  TLP_SIGMA                 = 24; // Conductivity of the conductor
+  TLP_SKIN_DEPTH            = 25;
+  TLP_LOSS_DIELECTRIC       = 26; // dB
+  TLP_LOSS_CONDUCTOR        = 27; // dB
+  TLP_CUTOFF_FREQUENCY      = 28;
+  TLP_EPSILON_EFF           = 29;
+  TLP_EPSILON_EFF_EVEN      = 30;
+  TLP_EPSILON_EFF_ODD       = 31;
+  TLP_UNIT_PROP_DELAY       = 32; // ps/cm
+  TLP_UNIT_PROP_DELAY_ODD   = 33; // ps/cm
+  TLP_UNIT_PROP_DELAY_EVEN  = 34; // ps/cm
+  TLP_ATTEN_COND            = 35;
+  TLP_ATTEN_COND_EVEN       = 36;
+  TLP_ATTEN_COND_ODD        = 37;
+  TLP_ATTEN_DILECTRIC       = 38;
+  TLP_ATTEN_DILECTRIC_EVEN  = 39;
+  TLP_ATTEN_DILECTRIC_ODD   = 40;
+  TLP_Z_DIFF                = 41; // Differential impedance
+  TLP_Z_COMM                = 42; // Common mode impedance
+  TLP_COUPLING_K            = 43; // Coupling coefficient
+  TLP_CPW_BACKMETAL         = 44; // 1 for a grounded coplanar waveguide
+  TLP_DIELECTRIC_MODEL_SEL  = 45; // 0 constant, 1 Djordjevic-Sarkar
+  TLP_EPSILONR_SPEC_FREQ    = 46; // Frequency at which EPSILONR and TAND are specified
+  TLP_SOLDERMASK_PRESENT    = 47; // 1 to model a solder mask over the trace
+  TLP_SOLDERMASK_THICKNESS  = 48;
+  TLP_SOLDERMASK_EPSILONR   = 49;
+  TLP_SOLDERMASK_TAND       = 50;
+  TLP_SOLDERMASK_FILLS_GAPS = 51;
+}
+
+enum TransmissionLineMode
+{
+  TLMODE_ANALYZE    = 0; // Compute impedance, delay and losses from the geometry
+  TLMODE_SYNTHESIZE = 1; // Compute the geometry that gives the requested impedance
+}
+
+enum TransmissionLineSynthesis
+{
+  TLS_DEFAULT          = 0;
+  TLS_FIX_WIDTH        = 1; // Coupled lines: keep the width, solve for the gap
+  TLS_FIX_SPACING      = 2; // Coupled lines: keep the gap, solve for the width
+  TLS_FROM_ZDIFF_ZCOMM = 3; // Coupled lines: the target is TLP_Z_DIFF and TLP_Z_COMM
+}
+
+enum TransmissionLineStatus
+{
+  TLST_OK      = 0;
+  TLST_WARNING = 1;
+  TLST_ERROR   = 2;
+}
+
+message TransmissionLineValue
+{
+  TransmissionLineParameter parameter = 1;
+  double value = 2;
+}
+
+message TransmissionLineResult
+{
+  TransmissionLineParameter parameter = 1;
+  double value = 2;
+  TransmissionLineStatus status = 3;
+}
+
+// Runs one of the transmission line calculations used by the PCB Calculator and by the board
+// tuning profiles.  Parameters left unset take the PCB Calculator defaults: copper resistivity,
+// unit permeabilities and a skin depth computed from the frequency and conductivity.
+// Returns TransmissionLineResponse
+message CalculateTransmissionLine
+{
+  TransmissionLineModel model = 1;
+
+  repeated TransmissionLineValue parameters = 2;
+
+  TransmissionLineMode mode = 3;
+
+  TransmissionLineSynthesis synthesis = 4;
+
+  // The geometry parameter to solve for during synthesis, for models that support a choice
+  // (for example TLP_PHYS_WIDTH or TLP_PHYS_S for a coupled stripline)
+  optional TransmissionLineParameter synthesis_target = 5;
+}
+
+message TransmissionLineResponse
+{
+  // False when a synthesis did not converge
+  bool converged = 1;
+
+  // The outputs of the calculation (synthesis also reports the solved geometry)
+  repeated TransmissionLineResult results = 2;
+}

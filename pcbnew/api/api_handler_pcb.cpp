@@ -39,6 +39,7 @@
 #include <board_commit.h>
 #include <board_connected_item.h>
 #include <board_design_settings.h>
+#include <board_stackup_manager/stackup_predefined_prms.h>
 #include <core/kicad_algo.h>
 #include <footprint.h>
 #include <footprint_library_adapter.h>
@@ -145,6 +146,7 @@ API_HANDLER_PCB::API_HANDLER_PCB( std::shared_ptr<PCB_CONTEXT> aContext, PCB_EDI
     registerHandler<GetItems, GetItemsResponse>( &API_HANDLER_PCB::handleGetItems );
 
     registerHandler<SetBoardEnabledLayers, BoardEnabledLayersResponse>( &API_HANDLER_PCB::handleSetBoardEnabledLayers );
+    registerHandler<UpdateBoardStackup, BoardStackupResponse>( &API_HANDLER_PCB::handleUpdateBoardStackup );
     registerHandler<GetBoardDesignRules, BoardDesignRulesResponse>( &API_HANDLER_PCB::handleGetBoardDesignRules );
     registerHandler<SetBoardDesignRules, BoardDesignRulesResponse>( &API_HANDLER_PCB::handleSetBoardDesignRules );
     registerHandler<GetCustomDesignRules, CustomRulesResponse>( &API_HANDLER_PCB::handleGetCustomDesignRules );
@@ -696,6 +698,16 @@ HANDLER_RESULT<BoardEnabledLayersResponse> API_HANDLER_PCB::handleSetBoardEnable
             modified |= board->RemoveAllItemsOnLayer( layer_id );
     }
 
+    // Keep the physical stackup in step with the copper layer count, as the layer setup dialog does
+    BOARD_DESIGN_SETTINGS& bds = board->GetDesignSettings();
+
+    if( enabled != previousEnabled && bds.m_HasStackup
+        && bds.GetStackupDescriptor().SynchronizeWithBoard( &bds ) )
+    {
+        bds.SetBoardThickness( bds.GetStackupDescriptor().BuildBoardThicknessFromStackup() );
+        board->BumpDrillModelGeneration();
+    }
+
     if( enabled != previousEnabled || modified )
         onModified();
 
@@ -704,6 +716,137 @@ HANDLER_RESULT<BoardEnabledLayersResponse> API_HANDLER_PCB::handleSetBoardEnable
     response.set_copper_layer_count( copperLayerCount );
     board::PackLayerSet( *response.mutable_layers(), enabled );
 
+    return response;
+}
+
+
+HANDLER_RESULT<BoardStackupResponse> API_HANDLER_PCB::handleUpdateBoardStackup(
+        const HANDLER_CONTEXT<UpdateBoardStackup>& aCtx )
+{
+    if( std::optional<ApiResponseStatus> busy = checkForBusy() )
+        return tl::unexpected( *busy );
+
+    if( HANDLER_RESULT<bool> documentValidation = validateDocument( aCtx.Request.board() ); !documentValidation )
+        return tl::unexpected( documentValidation.error() );
+
+    auto badRequest =
+            []( const std::string& aMessage ) -> HANDLER_RESULT<BoardStackupResponse>
+            {
+                ApiResponseStatus e;
+                e.set_status( ApiStatusCode::AS_BAD_REQUEST );
+                e.set_error_message( aMessage );
+                return tl::unexpected( e );
+            };
+
+    BOARD*                 brd = board();
+    BOARD_DESIGN_SETTINGS& bds = brd->GetDesignSettings();
+    BOARD_STACKUP          requested;
+
+    if( !requested.Deserialize( aCtx.Request.stackup() ) )
+    {
+        return badRequest( "the stackup is not valid: it must list copper layers from top to bottom "
+                           "with dielectric layers between them and non-negative physical values" );
+    }
+
+    LSET     enabled = brd->GetEnabledLayers();
+    LSEQ     boardCopper = enabled.CuStack();
+    LSEQ     stackupCopper;
+    LSET     stackupLayers;
+
+    for( BOARD_STACKUP_ITEM* item : requested.GetList() )
+    {
+        if( item->GetType() == BS_ITEM_TYPE_COPPER )
+            stackupCopper.push_back( item->GetBrdLayerId() );
+
+        if( item->GetBrdLayerId() != UNDEFINED_LAYER )
+        {
+            if( stackupLayers.test( item->GetBrdLayerId() ) )
+            {
+                return badRequest( fmt::format( "layer {} appears more than once in the stackup",
+                                                brd->GetLayerName( item->GetBrdLayerId() ).ToStdString() ) );
+            }
+
+            stackupLayers.set( item->GetBrdLayerId() );
+        }
+    }
+
+    if( stackupCopper != boardCopper )
+    {
+        return badRequest( fmt::format( "the stackup has {} copper layers but the board has {} (in "
+                                        "order F.Cu, In1.Cu, ..., B.Cu); change the copper layer count "
+                                        "with SetBoardEnabledLayers first",
+                                        stackupCopper.size(), boardCopper.size() ) );
+    }
+
+    BOARD_STACKUP& stackup = bds.GetStackupDescriptor();
+
+    // Colors come back as RGBA; keep the existing names (e.g. "Green") when they are unchanged
+    auto oldItemFor =
+            [&]( const BOARD_STACKUP_ITEM* aItem ) -> const BOARD_STACKUP_ITEM*
+            {
+                for( const BOARD_STACKUP_ITEM* old : stackup.GetList() )
+                {
+                    if( old->GetType() != aItem->GetType() )
+                        continue;
+
+                    if( aItem->GetType() == BS_ITEM_TYPE_DIELECTRIC
+                            ? old->GetDielectricLayerId() == aItem->GetDielectricLayerId()
+                            : old->GetBrdLayerId() == aItem->GetBrdLayerId() )
+                    {
+                        return old;
+                    }
+                }
+
+                return nullptr;
+            };
+
+    // As in the stackup panel, only the enabled items on enabled board layers are kept
+    std::vector<BOARD_STACKUP_ITEM*> keep;
+
+    for( BOARD_STACKUP_ITEM* item : requested.GetList() )
+    {
+        if( !item->IsEnabled() )
+            continue;
+
+        if( item->GetBrdLayerId() != UNDEFINED_LAYER && !enabled.test( item->GetBrdLayerId() ) )
+            continue;
+
+        auto copy = new BOARD_STACKUP_ITEM( *item );
+
+        if( const BOARD_STACKUP_ITEM* old = oldItemFor( copy ); old && copy->IsColorEditable() )
+        {
+            wxString oldColor = old->GetColor( 0 );
+            wxString newColor = copy->GetColor( 0 );
+
+            if( IsPrmSpecified( oldColor ) && IsPrmSpecified( newColor )
+                && KIGFX::COLOR4D( oldColor ) == KIGFX::COLOR4D( newColor ) )
+            {
+                copy->SetColor( oldColor );
+            }
+        }
+
+        keep.push_back( copy );
+    }
+
+    stackup.RemoveAll();
+
+    for( BOARD_STACKUP_ITEM* item : keep )
+        stackup.Add( item );
+
+    stackup.m_FinishType = requested.m_FinishType;
+    stackup.m_HasDielectricConstrains = requested.m_HasDielectricConstrains;
+    stackup.m_EdgeConnectorConstraints = requested.m_EdgeConnectorConstraints;
+    stackup.m_EdgePlating = requested.m_EdgePlating;
+
+    bds.SetBoardThickness( stackup.BuildBoardThicknessFromStackup() );
+    bds.m_HasStackup = true;
+
+    // Backdrill stub lengths come from layer distances
+    brd->BumpDrillModelGeneration();
+    onModified();
+
+    BoardStackupResponse response;
+    board::PackBoardStackup( *brd, *response.mutable_stackup() );
     return response;
 }
 
@@ -1494,7 +1637,12 @@ void API_HANDLER_PCB::onModified()
 void API_HANDLER_PCB::onNetSettingsChanged()
 {
     if( BOARD* brd = board() )
+    {
+        // Tuning profiles first: the netclass sync recomputes lengths and delays from them, and
+        // the board caches pointers into the profile list (see PCB_EDIT_FRAME::RefreshProjectSettings)
+        brd->SynchronizeTuningProfileProperties();
         brd->SynchronizeNetsAndNetClasses( false );
+    }
 
     // Refresh UI that depends on netclasses, such as the properties panel
     if( TOOL_MANAGER* mgr = toolManager() )

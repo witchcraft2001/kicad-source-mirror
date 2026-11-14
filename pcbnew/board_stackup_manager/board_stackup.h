@@ -253,6 +253,16 @@ public:
     bool Deserialize( const google::protobuf::Any &aContainer ) override;
 
     void Serialize( kiapi::board::BoardStackup& aOutput ) const;
+
+    /**
+     * Replace the stackup with the layers and board-level settings of \a aInput.
+     *
+     * Dielectric layers are numbered in order and must sit between copper layers; copper, mask,
+     * paste and silkscreen items must name a board layer of their kind.  Colors are stored as
+     * RGBA hex strings.  On failure the stackup is left unchanged.
+     *
+     * @return false if the input is not a valid stackup
+     */
     bool Deserialize( const kiapi::board::BoardStackup& aInput );
 
     const std::vector<BOARD_STACKUP_ITEM*>& GetList() const { return m_list; }

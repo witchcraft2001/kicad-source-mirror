@@ -47,8 +47,12 @@ message BoardStackupResponse
   kiapi.board.BoardStackup stackup = 1;
 }
 
-// Changes the stackup for the given board according to the contents of the message (**not yet implemented**)
-// WARNING: any existing content on layers that are removed by this call is deleted.  This operation cannot be undone.
+// Replaces the physical stackup of the given board (layer thicknesses, dielectric materials,
+// solder mask, finish and impedance control).  The copper layers in the stackup must match the
+// copper layers enabled on the board, from F.Cu to B.Cu; change the copper layer count with
+// SetBoardEnabledLayers first (which also updates the stackup).  Disabled items, and items on
+// technical layers not enabled on the board, are dropped.  The board thickness is recomputed from
+// the stackup.  This operation cannot be undone.
 // Returns BoardStackupResponse with the updated stackup, in normalized form
 message UpdateBoardStackup
 {

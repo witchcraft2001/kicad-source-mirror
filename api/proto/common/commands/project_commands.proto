@@ -59,6 +59,32 @@ message SetNetClasses
   kiapi.common.types.ProjectSpecifier project = 4;
 }
 
+// Returns TuningProfilesResponse
+// Since: 11.0
+message GetTuningProfiles
+{
+  kiapi.common.types.ProjectSpecifier project = 1;
+}
+
+// Since: 11.0
+message TuningProfilesResponse
+{
+  repeated kiapi.common.project.TuningProfile profiles = 1;
+}
+
+// Creates or replaces tuning profiles.  Profiles are matched by name: in MMM_MERGE mode the named
+// profiles are replaced or added and others are kept; in MMM_REPLACE mode profiles not in the
+// request are removed.  Open boards pick up the new delays immediately.
+// Since: 11.0
+message SetTuningProfiles
+{
+  kiapi.common.types.ProjectSpecifier project = 1;
+
+  repeated kiapi.common.project.TuningProfile profiles = 2;
+
+  kiapi.common.types.MapMergeMode merge_mode = 3;
+}
+
 // Returns NetClassAssignmentsResponse
 // Since: 11.0
 message GetNetClassAssignments

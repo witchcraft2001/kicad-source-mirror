@@ -35,10 +35,18 @@
 #include <paths.h>
 #include <pgm_base.h>
 #include <api/api_plugin.h>
+#include <api/api_enums.h>
 #include <api/api_utils.h>
 #include <project/net_settings.h>
 #include <project/project_file.h>
+#include <project/tuning_profiles.h>
 #include <settings/settings_manager.h>
+#include <transline_calculations/coplanar.h>
+#include <transline_calculations/coupled_microstrip.h>
+#include <transline_calculations/coupled_stripline.h>
+#include <transline_calculations/microstrip.h>
+#include <transline_calculations/stripline.h>
+#include <transline_calculations/units.h>
 #include <wx/string.h>
 
 using namespace kiapi::common::commands;
@@ -58,6 +66,8 @@ API_HANDLER_COMMON::API_HANDLER_COMMON() :
     registerHandler<GetNetClassAssignments, NetClassAssignmentsResponse>(
             &API_HANDLER_COMMON::handleGetNetClassAssignments );
     registerHandler<SetNetClassAssignments, Empty>( &API_HANDLER_COMMON::handleSetNetClassAssignments );
+    registerHandler<GetTuningProfiles, TuningProfilesResponse>( &API_HANDLER_COMMON::handleGetTuningProfiles );
+    registerHandler<SetTuningProfiles, Empty>( &API_HANDLER_COMMON::handleSetTuningProfiles );
     registerHandler<Ping, Empty>( &API_HANDLER_COMMON::handlePing );
     registerHandler<GetTextExtents, types::Box2>( &API_HANDLER_COMMON::handleGetTextExtents );
     registerHandler<GetTextAsShapes, GetTextAsShapesResponse>(
@@ -80,6 +90,8 @@ API_HANDLER_COMMON::API_HANDLER_COMMON() :
             &API_HANDLER_COMMON::handleCreateDocument );
     registerHandler<tasks::GetTaskStatus, tasks::TaskStatusResponse>(
             &API_HANDLER_COMMON::handleGetTaskStatus, true );
+    registerHandler<CalculateTransmissionLine, TransmissionLineResponse>(
+            &API_HANDLER_COMMON::handleCalculateTransmissionLine );
 }
 
 
@@ -232,6 +244,248 @@ HANDLER_RESULT<Empty> API_HANDLER_COMMON::handleSetNetClasses( const HANDLER_CON
     }
 
     netSettings->SetNetclasses( netClasses );
+    requestNetSettingsNotification();
+
+    return Empty();
+}
+
+
+HANDLER_RESULT<TuningProfilesResponse>
+API_HANDLER_COMMON::handleGetTuningProfiles( const HANDLER_CONTEXT<GetTuningProfiles>& aCtx )
+{
+    if( tl::expected<bool, ApiResponseStatus> result = validateProject( aCtx.Request.project(), true ); !result )
+        return tl::unexpected( result.error() );
+
+    using kiapi::board::types::BoardLayer;
+
+    TuningProfilesResponse reply;
+
+    std::shared_ptr<TUNING_PROFILES>& profiles =
+            Pgm().GetSettingsManager().Prj().GetProjectFile().TuningProfileParameters();
+
+    if( !profiles )
+        return reply;
+
+    for( const TUNING_PROFILE& profile : profiles->GetTuningProfiles() )
+    {
+        project::TuningProfile* out = reply.add_profiles();
+        out->set_name( profile.m_ProfileName.ToUTF8() );
+        out->set_type( profile.m_Type == TUNING_PROFILE::PROFILE_TYPE::DIFFERENTIAL
+                               ? project::TuningProfileType::TPT_DIFFERENTIAL
+                               : project::TuningProfileType::TPT_SINGLE );
+        out->set_target_impedance( profile.m_TargetImpedance );
+        out->set_frequency( profile.m_Frequency );
+        out->set_enable_time_domain_tuning( profile.m_EnableTimeDomainTuning );
+        out->set_model_solder_mask( profile.m_ModelSolderMask );
+        out->set_via_delay_per_mm( profile.m_ViaPropagationDelay );
+        out->set_net_chain_bridge_delay_per_mm( profile.m_NetChainBridgePropagationDelay );
+
+        for( const DELAY_PROFILE_TRACK_PROPAGATION_ENTRY& entry : profile.m_TrackPropagationEntries )
+        {
+            project::TuningProfileLayer* layer = out->add_layers();
+            layer->set_signal_layer( ToProtoEnum<PCB_LAYER_ID, BoardLayer>( entry.GetSignalLayer() ) );
+            layer->set_top_reference_layer( ToProtoEnum<PCB_LAYER_ID, BoardLayer>( entry.GetTopReferenceLayer() ) );
+            layer->set_bottom_reference_layer(
+                    ToProtoEnum<PCB_LAYER_ID, BoardLayer>( entry.GetBottomReferenceLayer() ) );
+            layer->mutable_width()->set_value_nm( entry.GetWidth() );
+            layer->mutable_diff_pair_gap()->set_value_nm( entry.GetDiffPairGap() );
+            layer->set_delay_per_mm( entry.GetDelay( true ) );
+        }
+
+        for( const DELAY_PROFILE_VIA_OVERRIDE_ENTRY& entry : profile.m_ViaOverrides )
+        {
+            project::TuningProfileViaOverride* via = out->add_via_overrides();
+            via->set_signal_layer_from( ToProtoEnum<PCB_LAYER_ID, BoardLayer>( entry.m_SignalLayerFrom ) );
+            via->set_signal_layer_to( ToProtoEnum<PCB_LAYER_ID, BoardLayer>( entry.m_SignalLayerTo ) );
+            via->set_via_layer_from( ToProtoEnum<PCB_LAYER_ID, BoardLayer>( entry.m_ViaLayerFrom ) );
+            via->set_via_layer_to( ToProtoEnum<PCB_LAYER_ID, BoardLayer>( entry.m_ViaLayerTo ) );
+            via->mutable_delay()->set_value_as( entry.m_Delay );
+        }
+    }
+
+    return reply;
+}
+
+
+HANDLER_RESULT<Empty>
+API_HANDLER_COMMON::handleSetTuningProfiles( const HANDLER_CONTEXT<SetTuningProfiles>& aCtx )
+{
+    if( tl::expected<bool, ApiResponseStatus> result = validateProject( aCtx.Request.project(), true ); !result )
+        return tl::unexpected( result.error() );
+
+    auto badRequest =
+            []( const std::string& aMessage ) -> HANDLER_RESULT<Empty>
+            {
+                ApiResponseStatus e;
+                e.set_status( ApiStatusCode::AS_BAD_REQUEST );
+                e.set_error_message( aMessage );
+                return tl::unexpected( e );
+            };
+
+    std::shared_ptr<TUNING_PROFILES>& profiles =
+            Pgm().GetSettingsManager().Prj().GetProjectFile().TuningProfileParameters();
+
+    if( !profiles )
+        return badRequest( "the project has no tuning profile settings" );
+
+    // Delays and dimensions are stored as int
+    constexpr int64_t intMax = std::numeric_limits<int>::max();
+
+    auto copperLayer =
+            []( kiapi::board::types::BoardLayer aLayer, bool aAllowNone ) -> std::optional<PCB_LAYER_ID>
+            {
+                PCB_LAYER_ID layer = FromProtoEnum<PCB_LAYER_ID>( aLayer );
+
+                if( aAllowNone && layer == UNDEFINED_LAYER )
+                    return layer;
+
+                if( !IsCopperLayer( layer ) )
+                    return std::nullopt;
+
+                return layer;
+            };
+
+    std::vector<TUNING_PROFILE> incoming;
+    std::set<wxString>          names;
+
+    for( const project::TuningProfile& in : aCtx.Request.profiles() )
+    {
+        wxString name = wxString::FromUTF8( in.name() );
+        name.Trim( true ).Trim( false );
+
+        if( name.IsEmpty() )
+            return badRequest( "a tuning profile must have a name" );
+
+        if( !names.insert( name ).second )
+            return badRequest( fmt::format( "tuning profile '{}' is given more than once", in.name() ) );
+
+        TUNING_PROFILE profile{};
+        profile.m_ProfileName = name;
+
+        switch( in.type() )
+        {
+        case project::TuningProfileType::TPT_SINGLE:
+            profile.m_Type = TUNING_PROFILE::PROFILE_TYPE::SINGLE;
+            break;
+
+        case project::TuningProfileType::TPT_DIFFERENTIAL:
+            profile.m_Type = TUNING_PROFILE::PROFILE_TYPE::DIFFERENTIAL;
+            break;
+
+        default:
+            return badRequest( fmt::format( "tuning profile '{}' needs a type", in.name() ) );
+        }
+
+        if( in.target_impedance() < 0 || in.frequency() < 0 || in.via_delay_per_mm() < 0
+            || in.via_delay_per_mm() > intMax || in.net_chain_bridge_delay_per_mm() < 0
+            || in.net_chain_bridge_delay_per_mm() > intMax )
+        {
+            return badRequest( fmt::format( "tuning profile '{}' has a negative or out of range value",
+                                            in.name() ) );
+        }
+
+        profile.m_TargetImpedance = in.target_impedance();
+        profile.m_Frequency = in.frequency() > 0 ? in.frequency() : 1e9;
+        profile.m_EnableTimeDomainTuning = in.enable_time_domain_tuning();
+        profile.m_ModelSolderMask = in.model_solder_mask();
+        profile.m_ViaPropagationDelay = static_cast<int>( in.via_delay_per_mm() );
+        profile.m_NetChainBridgePropagationDelay = static_cast<int>( in.net_chain_bridge_delay_per_mm() );
+
+        for( const project::TuningProfileLayer& layerIn : in.layers() )
+        {
+            std::optional<PCB_LAYER_ID> signal = copperLayer( layerIn.signal_layer(), false );
+            std::optional<PCB_LAYER_ID> top = copperLayer( layerIn.top_reference_layer(), true );
+            std::optional<PCB_LAYER_ID> bottom = copperLayer( layerIn.bottom_reference_layer(), true );
+
+            if( !signal || !top || !bottom )
+            {
+                return badRequest( fmt::format( "tuning profile '{}': signal and reference layers must be "
+                                                "copper layers", in.name() ) );
+            }
+
+            if( profile.m_TrackPropagationEntriesMap.contains( *signal ) )
+            {
+                return badRequest( fmt::format( "tuning profile '{}': signal layer {} is given more than once",
+                                                in.name(), LSET::Name( *signal ).ToStdString() ) );
+            }
+
+            if( layerIn.width().value_nm() < 0 || layerIn.width().value_nm() > intMax
+                || layerIn.diff_pair_gap().value_nm() < 0 || layerIn.diff_pair_gap().value_nm() > intMax
+                || layerIn.delay_per_mm() < 0 || layerIn.delay_per_mm() > intMax )
+            {
+                return badRequest( fmt::format( "tuning profile '{}': layer {} has a negative or out of "
+                                                "range value", in.name(), LSET::Name( *signal ).ToStdString() ) );
+            }
+
+            DELAY_PROFILE_TRACK_PROPAGATION_ENTRY entry;
+            entry.SetSignalLayer( *signal );
+            entry.SetTopReferenceLayer( *top );
+            entry.SetBottomReferenceLayer( *bottom );
+            entry.SetWidth( static_cast<int>( layerIn.width().value_nm() ) );
+            entry.SetDiffPairGap( static_cast<int>( layerIn.diff_pair_gap().value_nm() ) );
+            entry.SetDelay( static_cast<int>( layerIn.delay_per_mm() ) );
+            entry.SetEnableTimeDomainTuning( profile.m_EnableTimeDomainTuning );
+
+            profile.m_TrackPropagationEntries.push_back( entry );
+
+            // The delay lookup goes through this map, so it must be filled as when loading a project
+            profile.m_TrackPropagationEntriesMap[*signal] = entry;
+        }
+
+        for( const project::TuningProfileViaOverride& viaIn : in.via_overrides() )
+        {
+            std::optional<PCB_LAYER_ID> signalFrom = copperLayer( viaIn.signal_layer_from(), false );
+            std::optional<PCB_LAYER_ID> signalTo = copperLayer( viaIn.signal_layer_to(), false );
+            std::optional<PCB_LAYER_ID> viaFrom = copperLayer( viaIn.via_layer_from(), false );
+            std::optional<PCB_LAYER_ID> viaTo = copperLayer( viaIn.via_layer_to(), false );
+
+            if( !signalFrom || !signalTo || !viaFrom || !viaTo )
+            {
+                return badRequest( fmt::format( "tuning profile '{}': via override layers must be copper "
+                                                "layers", in.name() ) );
+            }
+
+            if( viaIn.delay().value_as() < 0 || viaIn.delay().value_as() > intMax )
+            {
+                return badRequest( fmt::format( "tuning profile '{}': via override delay is negative or out "
+                                                "of range", in.name() ) );
+            }
+
+            // The delay lookup expects the upper layer first, as the board setup dialog saves them
+            if( IsCopperLayerLowerThan( *signalFrom, *signalTo ) )
+                std::swap( signalFrom, signalTo );
+
+            if( IsCopperLayerLowerThan( *viaFrom, *viaTo ) )
+                std::swap( viaFrom, viaTo );
+
+            profile.m_ViaOverrides.push_back( DELAY_PROFILE_VIA_OVERRIDE_ENTRY{
+                    *signalFrom, *signalTo, *viaFrom, *viaTo, static_cast<int>( viaIn.delay().value_as() ) } );
+        }
+
+        std::sort( profile.m_ViaOverrides.begin(), profile.m_ViaOverrides.end() );
+        incoming.push_back( std::move( profile ) );
+    }
+
+    std::vector<TUNING_PROFILE> result;
+
+    if( aCtx.Request.merge_mode() != MapMergeMode::MMM_REPLACE )
+    {
+        for( const TUNING_PROFILE& existing : profiles->GetTuningProfiles() )
+        {
+            if( !names.contains( existing.m_ProfileName ) )
+                result.push_back( existing );
+        }
+    }
+
+    for( TUNING_PROFILE& profile : incoming )
+        result.push_back( std::move( profile ) );
+
+    profiles->ClearTuningProfiles();
+
+    for( TUNING_PROFILE& profile : result )
+        profiles->AddTuningProfile( std::move( profile ) );
+
+    // Boards cache pointers into the profile list; the notification rebuilds those caches
     requestNetSettingsNotification();
 
     return Empty();
@@ -744,4 +998,201 @@ HANDLER_RESULT<tasks::TaskStatusResponse> API_HANDLER_COMMON::handleGetTaskStatu
     }
 
     return *status;
+}
+
+
+namespace
+{
+
+// The proto parameter enum mirrors TRANSLINE_PARAMETERS shifted by one (proto zero is UNKNOWN_ID)
+TRANSLINE_PARAMETERS translineParamFromProto( TransmissionLineParameter aParam )
+{
+    int value = static_cast<int>( aParam ) - 1;
+
+    if( value < 0 || value >= static_cast<int>( TRANSLINE_PARAMETERS::EXTRAS_COUNT ) )
+        return TRANSLINE_PARAMETERS::UNKNOWN_ID;
+
+    return static_cast<TRANSLINE_PARAMETERS>( value );
+}
+
+
+TransmissionLineParameter translineParamToProto( TRANSLINE_PARAMETERS aParam )
+{
+    return static_cast<TransmissionLineParameter>( static_cast<int>( aParam ) + 1 );
+}
+
+
+bool translineHasParam( const TRANSLINE_CALCULATION_BASE& aCalc, TRANSLINE_PARAMETERS aParam )
+{
+    try
+    {
+        aCalc.GetParameter( aParam );
+        return true;
+    }
+    catch( const std::out_of_range& )
+    {
+        return false;
+    }
+}
+
+} // namespace
+
+
+HANDLER_RESULT<TransmissionLineResponse> API_HANDLER_COMMON::handleCalculateTransmissionLine(
+        const HANDLER_CONTEXT<CalculateTransmissionLine>& aCtx )
+{
+    using TCP = TRANSLINE_PARAMETERS;
+
+    auto badRequest =
+            []( const std::string& aMessage ) -> HANDLER_RESULT<TransmissionLineResponse>
+            {
+                ApiResponseStatus e;
+                e.set_status( ApiStatusCode::AS_BAD_REQUEST );
+                e.set_error_message( aMessage );
+                return tl::unexpected( e );
+            };
+
+    const CalculateTransmissionLine& request = aCtx.Request;
+    std::unique_ptr<TRANSLINE_CALCULATION_BASE> calc;
+
+    switch( request.model() )
+    {
+    case TLM_MICROSTRIP:         calc = std::make_unique<MICROSTRIP>();         break;
+    case TLM_COUPLED_MICROSTRIP: calc = std::make_unique<COUPLED_MICROSTRIP>(); break;
+    case TLM_STRIPLINE:          calc = std::make_unique<STRIPLINE>();          break;
+    case TLM_COUPLED_STRIPLINE:  calc = std::make_unique<COUPLED_STRIPLINE>();  break;
+    case TLM_COPLANAR:           calc = std::make_unique<COPLANAR>();           break;
+    default:                     return badRequest( "an unknown transmission line model was given" );
+    }
+
+    // Copper resistivity used by the PCB Calculator and the tuning profile calculations
+    constexpr double copperRho = 1.72e-8;
+
+    std::map<TCP, double> given;
+    std::optional<double> rho;
+
+    for( const TransmissionLineValue& value : request.parameters() )
+    {
+        TCP param = translineParamFromProto( value.parameter() );
+
+        if( param == TCP::UNKNOWN_ID )
+            return badRequest( "an unknown transmission line parameter was given" );
+
+        if( !std::isfinite( value.value() ) )
+        {
+            return badRequest( fmt::format( "parameter {} is not a finite number",
+                                            TransmissionLineParameter_Name( value.parameter() ) ) );
+        }
+
+        // Resistivity is how the PCB Calculator takes conductivity; no model stores it directly
+        if( param == TCP::RHO )
+        {
+            if( value.value() <= 0 )
+                return badRequest( "TLP_RHO must be positive" );
+
+            rho = value.value();
+            continue;
+        }
+
+        if( !translineHasParam( *calc, param ) )
+        {
+            return badRequest( fmt::format( "parameter {} is not used by the {} model",
+                                            TransmissionLineParameter_Name( value.parameter() ),
+                                            TransmissionLineModel_Name( request.model() ) ) );
+        }
+
+        given[param] = value.value();
+    }
+
+    // Defaults match the PCB Calculator and the tuning profile panel
+    auto setDefault =
+            [&]( TCP aParam, double aValue )
+            {
+                if( translineHasParam( *calc, aParam ) && !given.contains( aParam ) )
+                    calc->SetParameter( aParam, aValue );
+            };
+
+    setDefault( TCP::SIGMA, 1.0 / rho.value_or( copperRho ) );
+    setDefault( TCP::MUR, 1.0 );
+    setDefault( TCP::MURC, 1.0 );
+    setDefault( TCP::EPSILON_EFF, 1.0 );
+    setDefault( TCP::H_T, 1e20 );
+    setDefault( TCP::FREQUENCY, 1e9 );
+    setDefault( TCP::PHYS_LEN, 1.0 );
+    setDefault( TCP::ANG_L, 1.0 );
+
+    for( const auto& [param, value] : given )
+        calc->SetParameter( param, value );
+
+    if( translineHasParam( *calc, TCP::SKIN_DEPTH ) && !given.contains( TCP::SKIN_DEPTH ) )
+    {
+        double sigma = calc->GetParameter( TCP::SIGMA );
+        double freq = calc->GetParameter( TCP::FREQUENCY );
+        double murc = calc->GetParameter( TCP::MURC );
+
+        if( sigma > 0 && freq > 0 && murc > 0 )
+        {
+            calc->SetParameter( TCP::SKIN_DEPTH,
+                                1.0 / std::sqrt( M_PI * freq * murc * TRANSLINE_CALCULATIONS::MU0 * sigma ) );
+        }
+    }
+
+    TransmissionLineResponse response;
+    std::unordered_map<TCP, std::pair<double, TRANSLINE_STATUS>>* results = nullptr;
+
+    if( request.mode() == TLMODE_SYNTHESIZE )
+    {
+        if( request.has_synthesis_target() )
+        {
+            TCP target = translineParamFromProto( request.synthesis_target() );
+
+            if( target == TCP::UNKNOWN_ID || !translineHasParam( *calc, target ) )
+                return badRequest( "the synthesis target is not a parameter of this model" );
+
+            calc->SetSynthesizeTarget( target );
+        }
+
+        SYNTHESIZE_OPTS opts = SYNTHESIZE_OPTS::DEFAULT;
+
+        switch( request.synthesis() )
+        {
+        case TLS_FIX_WIDTH:        opts = SYNTHESIZE_OPTS::FIX_WIDTH;        break;
+        case TLS_FIX_SPACING:      opts = SYNTHESIZE_OPTS::FIX_SPACING;      break;
+        case TLS_FROM_ZDIFF_ZCOMM: opts = SYNTHESIZE_OPTS::FROM_ZDIFF_ZCOMM; break;
+        default:                   break;
+        }
+
+        response.set_converged( calc->Synthesize( opts ) );
+        results = &calc->GetSynthesisResults();
+    }
+    else
+    {
+        calc->Analyse();
+        response.set_converged( true );
+        results = &calc->GetAnalysisResults();
+    }
+
+    std::vector<std::pair<TCP, std::pair<double, TRANSLINE_STATUS>>> sorted( results->begin(),
+                                                                             results->end() );
+    std::sort( sorted.begin(), sorted.end(),
+               []( const auto& a, const auto& b )
+               {
+                   return a.first < b.first;
+               } );
+
+    for( const auto& [param, result] : sorted )
+    {
+        TransmissionLineResult* out = response.add_results();
+        out->set_parameter( translineParamToProto( param ) );
+        out->set_value( result.first );
+
+        switch( result.second )
+        {
+        case TRANSLINE_STATUS::OK:       out->set_status( TLST_OK );      break;
+        case TRANSLINE_STATUS::WARNING:  out->set_status( TLST_WARNING ); break;
+        case TRANSLINE_STATUS::TS_ERROR: out->set_status( TLST_ERROR );   break;
+        }
+    }
+
+    return response;
 }
