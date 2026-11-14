@@ -35,6 +35,8 @@
 #include <wx/textfile.h>
 
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 
 
 namespace
@@ -154,6 +156,80 @@ BOOST_AUTO_TEST_CASE( SearchFindsFootprintsBySizeAndCountsPads )
     result = handler.Handle( request );
     BOOST_REQUIRE( !result.has_value() );
     BOOST_CHECK_EQUAL( result.error().status(), ApiStatusCode::AS_UNHANDLED );
+}
+
+
+BOOST_AUTO_TEST_CASE( FootprintLibraryTableEditsAddAndDeleteALibrary )
+{
+    // A second library: a copy of the one the table lists
+    std::error_code ec;
+    std::filesystem::copy( m_dir / "Resistor_SMD.pretty", m_dir / "Extra.pretty", ec );
+    BOOST_REQUIRE( !ec );
+
+    API_HANDLER_FP_LIBRARIES handler;
+
+    auto send = [&]( const google::protobuf::Message& aCommand )
+    {
+        kiapi::common::ApiRequest request;
+        request.mutable_header()->set_client_name( "kicad.qa" );
+        BOOST_REQUIRE( request.mutable_message()->PackFrom( aCommand ) );
+
+        API_RESULT result = handler.Handle( request );
+        BOOST_REQUIRE( result.has_value() );
+
+        kiapi::common::types::LibraryCommandStatus status;
+        BOOST_REQUIRE( result->message().UnpackTo( &status ) );
+        return status;
+    };
+
+    auto tableText = [&]()
+    {
+        std::ifstream in( m_dir / "fp-lib-table" );
+        return std::string( std::istreambuf_iterator<char>( in ), std::istreambuf_iterator<char>() );
+    };
+
+    AddLibraryTableEntry add;
+    add.set_scope( kiapi::common::types::LibraryTableScope::LTS_PROJECT );
+    add.mutable_entry()->set_type( kiapi::common::types::LibraryType::LT_FOOTPRINT );
+    add.mutable_entry()->set_nickname( "Extra" );
+    add.mutable_entry()->set_uri( "${KIPRJMOD}/Extra.pretty" );
+
+    BOOST_CHECK_EQUAL( send( add ).code(), kiapi::common::types::LibraryCommandStatus::LCS_OK );
+
+    std::string text = tableText();
+    BOOST_CHECK( text.find( "(name \"Extra\")" ) != std::string::npos );
+    BOOST_CHECK( text.find( "(type \"KiCad\")" ) != std::string::npos );
+    BOOST_CHECK( text.find( "(name \"Resistor_SMD\")" ) != std::string::npos );
+
+    std::optional<LIB_STATUS> loaded = m_adapter->GetLibraryStatus( wxS( "Extra" ) );
+    BOOST_REQUIRE( loaded );
+    BOOST_CHECK( loaded->load_status == LOAD_STATUS::LOADED );
+
+    BOOST_CHECK_EQUAL( send( add ).code(), kiapi::common::types::LibraryCommandStatus::LCS_ALREADY_EXISTS );
+
+    // The symbol type is left to the symbol handler
+    {
+        kiapi::common::ApiRequest request;
+        request.mutable_header()->set_client_name( "kicad.qa" );
+        add.mutable_entry()->set_type( kiapi::common::types::LibraryType::LT_SYMBOL );
+        BOOST_REQUIRE( request.mutable_message()->PackFrom( add ) );
+
+        API_RESULT result = handler.Handle( request );
+        BOOST_REQUIRE( !result.has_value() );
+        BOOST_CHECK_EQUAL( result.error().status(), ApiStatusCode::AS_UNHANDLED );
+    }
+
+    DeleteLibraryTableEntry del;
+    del.set_type( kiapi::common::types::LibraryType::LT_FOOTPRINT );
+    del.set_scope( kiapi::common::types::LibraryTableScope::LTS_PROJECT );
+    del.set_nickname( "Extra" );
+
+    BOOST_CHECK_EQUAL( send( del ).code(), kiapi::common::types::LibraryCommandStatus::LCS_OK );
+
+    text = tableText();
+    BOOST_CHECK( text.find( "(name \"Extra\")" ) == std::string::npos );
+    BOOST_CHECK( text.find( "(name \"Resistor_SMD\")" ) != std::string::npos );
+    BOOST_CHECK( std::filesystem::exists( m_dir / "Extra.pretty" ) );
 }
 
 

@@ -26,6 +26,7 @@
 #include <project_sch.h>
 #include <settings/settings_manager.h>
 #include <lib_symbol.h>
+#include <sch_io/sch_io_mgr.h>
 
 
 LIBRARY_MANAGER_ADAPTER* API_HANDLER_SCH_LIBRARIES::adapterForProject( PROJECT& aProject ) const
@@ -81,4 +82,16 @@ bool API_HANDLER_SCH_LIBRARIES::packLibraryItem( const LIB_ID& aId, google::prot
     ( flattened ? flattened.get() : libSymbol )->Serialize( aOutput );
 
     return true;
+}
+
+
+wxString API_HANDLER_SCH_LIBRARIES::guessPluginType( const wxString& aExpandedUri ) const
+{
+    SCH_IO_MGR::SCH_FILE_T type = SCH_IO_MGR::GuessPluginTypeFromLibPath( aExpandedUri );
+
+    // A location that cannot be read (yet) is taken to be a KiCad library
+    if( type == SCH_IO_MGR::SCH_FILE_UNKNOWN )
+        return API_HANDLER_LIBRARIES::guessPluginType( aExpandedUri );
+
+    return SCH_IO_MGR::ShowType( type );
 }

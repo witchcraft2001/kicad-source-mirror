@@ -64,8 +64,15 @@ message LibraryTableResponse
   repeated kiapi.common.types.LibraryTableEntry rows = 2;
 }
 
-// Inserts a new row into the given library table.
-// Returns LibraryCommandStatus
+// Inserts a new row into the given library table and writes the table file.  The library is
+// loaded right away; if it cannot be read the row stays and the status carries a message.
+// The entry's scope and writable fields are ignored (the scope of the command decides), and the
+// plugin type of the row is chosen from the location.  Reloading the table unloads the other
+// libraries of the same scope and type; they are loaded again when they are next used.
+// GUI frames that already show the libraries are not told about the change.
+// Returns LibraryCommandStatus: LCS_ALREADY_EXISTS if the nickname is taken in that scope,
+// LCS_READ_ONLY if the table file cannot be written, LCS_ERROR if there is no table, it is
+// damaged or saving fails.
 // Since: 11.0
 message AddLibraryTableEntry
 {
@@ -75,8 +82,11 @@ message AddLibraryTableEntry
   kiapi.common.types.LibraryTableScope scope = 2;
 }
 
-// Modifies an existing row, matched by entry.nickname (and scope).
-// Returns LibraryCommandStatus
+// Modifies an existing row, matched by entry.nickname (and scope).  The nickname cannot be
+// changed.  The location, description, options and flags of the row are replaced by those of
+// the entry.  The plugin type is chosen again only when the location changes.  Rows of nested
+// tables, such as the stock libraries, cannot be modified (LCS_READ_ONLY).
+// Returns LibraryCommandStatus: LCS_NOT_FOUND if the table has no such row
 // Since: 11.0
 message UpdateLibraryTableEntry
 {
@@ -86,8 +96,9 @@ message UpdateLibraryTableEntry
   kiapi.common.types.LibraryTableScope scope = 2;
 }
 
-// Deletes a row from the given library table by nickname.
-// Returns LibraryCommandStatus
+// Deletes a row from the given library table by nickname.  The files of the library are kept.
+// Rows of nested tables cannot be deleted (LCS_READ_ONLY).
+// Returns LibraryCommandStatus: LCS_NOT_FOUND if the table has no such row
 // Since: 11.0
 message DeleteLibraryTableEntry
 {

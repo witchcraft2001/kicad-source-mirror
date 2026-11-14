@@ -41,6 +41,8 @@ protected:
                                                 const wxString&          aNickname ) const override;
 
     bool supportsSearch() const override { return true; }
+
+    wxString guessPluginType( const wxString& aExpandedUri ) const override;
 };
 
 #endif //KICAD_API_HANDLER_FP_LIBRARIES_H

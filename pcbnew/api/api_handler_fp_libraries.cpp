@@ -23,6 +23,7 @@
 #include <footprint.h>
 #include <footprint_library_adapter.h>
 #include <pgm_base.h>
+#include <pcb_io/pcb_io_mgr.h>
 #include <project_pcb.h>
 #include <settings/settings_manager.h>
 
@@ -71,4 +72,16 @@ bool API_HANDLER_FP_LIBRARIES::packLibraryItem( const LIB_ID& aId, google::proto
         wxFAIL_MSG( wxString::Format( wxT( "Failed to pack footprint '%s'" ), aId.GetUniStringLibId() ) );
 
     return true;
+}
+
+
+wxString API_HANDLER_FP_LIBRARIES::guessPluginType( const wxString& aExpandedUri ) const
+{
+    PCB_IO_MGR::PCB_FILE_T type = PCB_IO_MGR::GuessPluginTypeFromLibPath( aExpandedUri );
+
+    // A location that cannot be read (yet) is taken to be a KiCad library
+    if( type == PCB_IO_MGR::FILE_TYPE_NONE )
+        return API_HANDLER_LIBRARIES::guessPluginType( aExpandedUri );
+
+    return PCB_IO_MGR::ShowType( type );
 }

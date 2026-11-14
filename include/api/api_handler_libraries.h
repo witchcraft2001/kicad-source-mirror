@@ -68,6 +68,16 @@ protected:
     HANDLER_RESULT<kiapi::common::commands::LibraryTableResponse>
     handleGetLibraryTable( const HANDLER_CONTEXT<kiapi::common::commands::GetLibraryTable>& aCtx );
 
+    /// Edits one row of a library table of this handler's type, then reloads the table
+    HANDLER_RESULT<kiapi::common::types::LibraryCommandStatus>
+    handleAddLibraryTableEntry( const HANDLER_CONTEXT<kiapi::common::commands::AddLibraryTableEntry>& aCtx );
+
+    HANDLER_RESULT<kiapi::common::types::LibraryCommandStatus>
+    handleUpdateLibraryTableEntry( const HANDLER_CONTEXT<kiapi::common::commands::UpdateLibraryTableEntry>& aCtx );
+
+    HANDLER_RESULT<kiapi::common::types::LibraryCommandStatus>
+    handleDeleteLibraryTableEntry( const HANDLER_CONTEXT<kiapi::common::commands::DeleteLibraryTableEntry>& aCtx );
+
     /// Ranks the items of the libraries against a query the way the library choosers do
     HANDLER_RESULT<kiapi::common::commands::SearchLibrariesResponse>
     handleSearchLibraries( const HANDLER_CONTEXT<kiapi::common::commands::SearchLibraries>& aCtx );
@@ -115,7 +125,24 @@ protected:
 
     virtual bool supportsSearch() const { return false; }
 
+    /**
+     * Returns the IO plugin name for a library table row that points at the given library.
+     *
+     * @param aExpandedUri is the library location with environment variables expanded.
+     * @return the table row type, "KiCad" unless the handler's type has other formats.
+     */
+    virtual wxString guessPluginType( const wxString& aExpandedUri ) const { return wxS( "KiCad" ); }
+
 private:
+    /**
+     * Checks the parts of a library table edit that do not depend on the table.
+     *
+     * @return the error to answer with, or nullopt if the request may proceed.
+     */
+    std::optional<ApiResponseStatus> checkTableEdit( kiapi::common::types::LibraryType aType,
+                                                     kiapi::common::types::LibraryTableScope aScope,
+                                                     const std::string& aNickname ) const;
+
     LIBRARY_TABLE_TYPE m_type;
 
     /// Used to lazily load kifaces for LoadAllLibraries in headless; null in GUI mode.

@@ -28,6 +28,7 @@
 #include <api/api_enums.h>
 #include <api/api_utils.h>
 #include <libraries/library_manager.h>
+#include <lib_id.h>
 #include <lib_tree_item.h>
 #include <lib_tree_model.h>
 #include <kiway.h>
@@ -52,6 +53,12 @@ API_HANDLER_LIBRARIES::API_HANDLER_LIBRARIES( LIBRARY_TABLE_TYPE aType ) :
     registerHandler<GetLibraryItems, LibraryItemsResponse>( &API_HANDLER_LIBRARIES::handleGetLibraryItems );
     registerHandler<GetLibraryTable, LibraryTableResponse>( &API_HANDLER_LIBRARIES::handleGetLibraryTable );
     registerHandler<SearchLibraries, SearchLibrariesResponse>( &API_HANDLER_LIBRARIES::handleSearchLibraries );
+    registerHandler<AddLibraryTableEntry, LibraryCommandStatus>(
+            &API_HANDLER_LIBRARIES::handleAddLibraryTableEntry );
+    registerHandler<UpdateLibraryTableEntry, LibraryCommandStatus>(
+            &API_HANDLER_LIBRARIES::handleUpdateLibraryTableEntry );
+    registerHandler<DeleteLibraryTableEntry, LibraryCommandStatus>(
+            &API_HANDLER_LIBRARIES::handleDeleteLibraryTableEntry );
     registerHandler<GetLibraryStatuses, LibraryStatusResponse>(
             &API_HANDLER_LIBRARIES::handleGetLibraryStatuses );
     registerHandler<ReloadLibrary, LibraryCommandStatus>( &API_HANDLER_LIBRARIES::handleReloadLibrary );
@@ -219,6 +226,322 @@ API_HANDLER_LIBRARIES::handleGetLibraryTable( const HANDLER_CONTEXT<GetLibraryTa
         packTableEntry( *response.add_rows(), tableType, *row, aCtx.Request.substituted() );
 
     return response;
+}
+
+
+static LibraryCommandStatus makeLibraryStatus( LibraryCommandStatus::Code aCode,
+                                               const wxString&            aMessage = wxEmptyString )
+{
+    LibraryCommandStatus status;
+    status.set_code( aCode );
+
+    if( !aMessage.empty() )
+        status.set_error_message( aMessage.ToUTF8() );
+
+    return status;
+}
+
+
+std::optional<ApiResponseStatus>
+API_HANDLER_LIBRARIES::checkTableEdit( LibraryType aType, LibraryTableScope aScope,
+                                       const std::string& aNickname ) const
+{
+    auto fail =
+            []( ApiStatusCode aCode, const std::string& aMessage = std::string() )
+            {
+                ApiResponseStatus e;
+                e.set_status( aCode );
+
+                if( !aMessage.empty() )
+                    e.set_error_message( aMessage );
+
+                return e;
+            };
+
+    if( aType == LibraryType::LT_UNKNOWN )
+        return fail( ApiStatusCode::AS_BAD_REQUEST, "a valid library type is required" );
+
+    // Each type has its own handler instance; the others pass the request on
+    if( aType != ToProtoEnum<LIBRARY_TABLE_TYPE, LibraryType>( m_type ) )
+        return fail( ApiStatusCode::AS_UNHANDLED );
+
+    if( aScope != LibraryTableScope::LTS_GLOBAL && aScope != LibraryTableScope::LTS_PROJECT )
+        return fail( ApiStatusCode::AS_BAD_REQUEST, "choose the global or the project table to modify" );
+
+    if( aNickname.empty() )
+        return fail( ApiStatusCode::AS_BAD_REQUEST, "a library nickname is required" );
+
+    // The nickname is the first part of a LIB_ID, so it cannot hold the separator or the other
+    // characters that LIB_ID refuses
+    if( LIB_ID::FindIllegalLibraryNameChar( UTF8( aNickname ) ) )
+    {
+        return fail( ApiStatusCode::AS_BAD_REQUEST,
+                     fmt::format( "'{}' is not a valid library nickname", aNickname ) );
+    }
+
+    return std::nullopt;
+}
+
+
+/**
+ * Finds the table that an edit changes.  The table is not returned when it is missing, damaged
+ * (saving would overwrite what the user has in the file) or read-only; aStatus then tells why.
+ */
+static LIBRARY_TABLE* editableTable( LIBRARY_TABLE_TYPE aType, LIBRARY_TABLE_SCOPE aScope,
+                                     LibraryCommandStatus& aStatus )
+{
+    std::optional<LIBRARY_TABLE*> table = Pgm().GetLibraryManager().Table( aType, aScope );
+
+    if( !table || !*table )
+    {
+        aStatus = makeLibraryStatus( LibraryCommandStatus::LCS_ERROR,
+                                     aScope == LIBRARY_TABLE_SCOPE::PROJECT
+                                             ? wxS( "There is no project library table; is a project open?" )
+                                             : wxS( "There is no global library table of this type" ) );
+        return nullptr;
+    }
+
+    if( !( *table )->IsOk() )
+    {
+        aStatus = makeLibraryStatus( LibraryCommandStatus::LCS_ERROR,
+                                     wxString::Format( wxS( "The library table '%s' is not valid: %s" ),
+                                                       ( *table )->Path(), ( *table )->ErrorDescription() ) );
+        return nullptr;
+    }
+
+    if( ( *table )->IsReadOnly() )
+    {
+        aStatus = makeLibraryStatus( LibraryCommandStatus::LCS_READ_ONLY,
+                                     wxString::Format( wxS( "The library table '%s' is read-only" ),
+                                                       ( *table )->Path() ) );
+        return nullptr;
+    }
+
+    return *table;
+}
+
+
+/**
+ * Writes an edited copy of a table and makes the library manager read it back.  The live table
+ * is never edited in place: other code keeps pointers to its rows, which an erase would leave
+ * dangling.  The reload replaces the table, and it unloads the other libraries of the scope,
+ * which are loaded again when they are next needed.
+ */
+static LibraryCommandStatus commitTableEdit( LIBRARY_TABLE& aEdited, LIBRARY_TABLE_TYPE aType,
+                                             LIBRARY_TABLE_SCOPE aScope )
+{
+    if( LIBRARY_RESULT<void> saved = aEdited.Save(); !saved )
+    {
+        return makeLibraryStatus( LibraryCommandStatus::LCS_ERROR,
+                                  wxString::Format( wxS( "The library table could not be saved: %s" ),
+                                                    saved.error().message ) );
+    }
+
+    Pgm().GetLibraryManager().ReloadTables( aScope, { aType } );
+
+    return makeLibraryStatus( LibraryCommandStatus::LCS_OK );
+}
+
+
+/// Fills the settings of a table row that a client can give
+static void applyEntry( LIBRARY_TABLE_ROW& aRow, const kiapi::common::types::LibraryTableEntry& aEntry )
+{
+    std::map<std::string, UTF8> options;
+
+    for( const auto& [key, value] : aEntry.options() )
+        options[key] = UTF8( value );
+
+    aRow.SetOptions( LIBRARY_TABLE::FormatOptions( &options ).wx_str() );
+    aRow.SetDescription( wxString::FromUTF8( aEntry.description() ) );
+    aRow.SetDisabled( aEntry.disabled() );
+    aRow.SetHidden( aEntry.hidden() );
+}
+
+
+HANDLER_RESULT<LibraryCommandStatus>
+API_HANDLER_LIBRARIES::handleAddLibraryTableEntry( const HANDLER_CONTEXT<AddLibraryTableEntry>& aCtx )
+{
+    const kiapi::common::types::LibraryTableEntry& entry = aCtx.Request.entry();
+
+    if( std::optional<ApiResponseStatus> error =
+                checkTableEdit( entry.type(), aCtx.Request.scope(), entry.nickname() ) )
+    {
+        return tl::unexpected( *error );
+    }
+
+    if( entry.uri().empty() )
+    {
+        ApiResponseStatus e;
+        e.set_status( ApiStatusCode::AS_BAD_REQUEST );
+        e.set_error_message( "the library location is required" );
+        return tl::unexpected( e );
+    }
+
+    const LIBRARY_TABLE_SCOPE scope = FromProtoEnum<LIBRARY_TABLE_SCOPE>( aCtx.Request.scope() );
+    const wxString            nickname = wxString::FromUTF8( entry.nickname() );
+    const wxString            uri = wxString::FromUTF8( entry.uri() );
+    LIBRARY_MANAGER&          manager = Pgm().GetLibraryManager();
+
+    LibraryCommandStatus status;
+    LIBRARY_TABLE*       live = editableTable( m_type, scope, status );
+
+    if( !live )
+        return status;
+
+    // A row of a nested table counts as well: the nickname has to stay unique in the scope
+    if( live->HasRow( nickname ) || manager.GetRow( m_type, nickname, scope ) )
+    {
+        return makeLibraryStatus( LibraryCommandStatus::LCS_ALREADY_EXISTS,
+                                  wxString::Format( wxS( "Library '%s' is already in the table" ), nickname ) );
+    }
+
+    LIBRARY_TABLE edited( *live );
+
+    LIBRARY_TABLE_ROW& row = edited.InsertRow();
+    row.SetNickname( nickname );
+    row.SetURI( uri );
+    row.SetType( guessPluginType( LIBRARY_MANAGER::ExpandURI( uri, Pgm().GetSettingsManager().Prj() ) ) );
+    applyEntry( row, entry );
+
+    status = commitTableEdit( edited, m_type, scope );
+
+    if( status.code() != LibraryCommandStatus::LCS_OK )
+        return status;
+
+    // Load the new library now so that the first query does not have to wait for it, and so that
+    // a library that cannot be read is reported to the caller.
+    if( std::optional<LIBRARY_MANAGER_ADAPTER*> adapter = manager.Adapter( m_type ); adapter && !row.Disabled() )
+    {
+        std::optional<LIB_STATUS> loaded = ( *adapter )->LoadLibraryEntry( nickname );
+
+        if( loaded && loaded->load_status == LOAD_STATUS::LOAD_ERROR )
+        {
+            status.set_error_message( wxString::Format( wxS( "The row was added but the library did not load: %s" ),
+                                                        loaded->error ? loaded->error->message : wxString( "?" ) )
+                                              .ToUTF8() );
+        }
+    }
+
+    return status;
+}
+
+
+HANDLER_RESULT<LibraryCommandStatus>
+API_HANDLER_LIBRARIES::handleUpdateLibraryTableEntry( const HANDLER_CONTEXT<UpdateLibraryTableEntry>& aCtx )
+{
+    const kiapi::common::types::LibraryTableEntry& entry = aCtx.Request.entry();
+
+    if( std::optional<ApiResponseStatus> error =
+                checkTableEdit( entry.type(), aCtx.Request.scope(), entry.nickname() ) )
+    {
+        return tl::unexpected( *error );
+    }
+
+    if( entry.uri().empty() )
+    {
+        ApiResponseStatus e;
+        e.set_status( ApiStatusCode::AS_BAD_REQUEST );
+        e.set_error_message( "the library location is required" );
+        return tl::unexpected( e );
+    }
+
+    const LIBRARY_TABLE_SCOPE scope = FromProtoEnum<LIBRARY_TABLE_SCOPE>( aCtx.Request.scope() );
+    const wxString            nickname = wxString::FromUTF8( entry.nickname() );
+    const wxString            uri = wxString::FromUTF8( entry.uri() );
+    LIBRARY_MANAGER&          manager = Pgm().GetLibraryManager();
+
+    LibraryCommandStatus status;
+    LIBRARY_TABLE*       live = editableTable( m_type, scope, status );
+
+    if( !live )
+        return status;
+
+    LIBRARY_TABLE edited( *live );
+
+    std::optional<LIBRARY_TABLE_ROW*> row = edited.Row( nickname );
+
+    if( !row )
+    {
+        // A library of a nested table (the stock libraries) cannot be changed from here
+        if( manager.GetRow( m_type, nickname, scope ) )
+        {
+            return makeLibraryStatus( LibraryCommandStatus::LCS_READ_ONLY,
+                                      wxString::Format( wxS( "Library '%s' belongs to a nested table" ), nickname ) );
+        }
+
+        return makeLibraryStatus( LibraryCommandStatus::LCS_NOT_FOUND,
+                                  wxString::Format( wxS( "Library '%s' is not in the table" ), nickname ) );
+    }
+
+    if( ( *row )->Type() == LIBRARY_TABLE_ROW::TABLE_TYPE_NAME )
+    {
+        return makeLibraryStatus( LibraryCommandStatus::LCS_READ_ONLY,
+                                  wxString::Format( wxS( "'%s' is a nested table, not a library" ), nickname ) );
+    }
+
+    // The type follows the location; guessing it again would reset what a client chose
+    if( ( *row )->URI() != uri )
+    {
+        ( *row )->SetURI( uri );
+        ( *row )->SetType( guessPluginType( LIBRARY_MANAGER::ExpandURI( uri, Pgm().GetSettingsManager().Prj() ) ) );
+    }
+
+    applyEntry( **row, entry );
+
+    status = commitTableEdit( edited, m_type, scope );
+
+    if( status.code() == LibraryCommandStatus::LCS_OK )
+    {
+        if( std::optional<LIBRARY_MANAGER_ADAPTER*> adapter = manager.Adapter( m_type ); adapter && !entry.disabled() )
+            ( *adapter )->LoadLibraryEntry( nickname );
+    }
+
+    return status;
+}
+
+
+HANDLER_RESULT<LibraryCommandStatus>
+API_HANDLER_LIBRARIES::handleDeleteLibraryTableEntry( const HANDLER_CONTEXT<DeleteLibraryTableEntry>& aCtx )
+{
+    if( std::optional<ApiResponseStatus> error =
+                checkTableEdit( aCtx.Request.type(), aCtx.Request.scope(), aCtx.Request.nickname() ) )
+    {
+        return tl::unexpected( *error );
+    }
+
+    const LIBRARY_TABLE_SCOPE scope = FromProtoEnum<LIBRARY_TABLE_SCOPE>( aCtx.Request.scope() );
+    const wxString            nickname = wxString::FromUTF8( aCtx.Request.nickname() );
+
+    LibraryCommandStatus status;
+    LIBRARY_TABLE*       live = editableTable( m_type, scope, status );
+
+    if( !live )
+        return status;
+
+    LIBRARY_TABLE edited( *live );
+
+    std::optional<LIBRARY_TABLE_ROW*> row = edited.Row( nickname );
+
+    if( !row )
+    {
+        if( Pgm().GetLibraryManager().GetRow( m_type, nickname, scope ) )
+        {
+            return makeLibraryStatus( LibraryCommandStatus::LCS_READ_ONLY,
+                                      wxString::Format( wxS( "Library '%s' belongs to a nested table" ), nickname ) );
+        }
+
+        return makeLibraryStatus( LibraryCommandStatus::LCS_NOT_FOUND,
+                                  wxString::Format( wxS( "Library '%s' is not in the table" ), nickname ) );
+    }
+
+    // The files of the library stay where they are
+    std::erase_if( edited.Rows(),
+                   [&]( const LIBRARY_TABLE_ROW& aRow )
+                   {
+                       return aRow.Nickname() == nickname;
+                   } );
+
+    return commitTableEdit( edited, m_type, scope );
 }
 
 
