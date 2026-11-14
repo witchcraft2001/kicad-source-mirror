@@ -185,6 +185,9 @@ private:
     HANDLER_RESULT<kiapi::common::commands::PlaceFromLibraryResponse> handlePlaceFootprintFromLibrary(
             const HANDLER_CONTEXT<kiapi::board::commands::PlaceFootprintFromLibrary>& aCtx );
 
+    HANDLER_RESULT<kiapi::board::commands::ExchangeFootprintsResponse> handleExchangeFootprints(
+            const HANDLER_CONTEXT<kiapi::board::commands::ExchangeFootprints>& aCtx );
+
     HANDLER_RESULT<types::RunJobResponse> handleRunBoardJobExportRender(
             const HANDLER_CONTEXT<RunBoardJobExportRender>& aCtx );
 

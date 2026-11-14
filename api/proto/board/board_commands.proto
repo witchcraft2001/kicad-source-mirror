@@ -873,6 +873,118 @@ message PlaceFootprintFromLibrary
   optional kiapi.board.types.BoardLayer layer = 5;
 }
 
+// Which parts of a footprint on the board are reset to the library definition by ExchangeFootprints.
+// The unset fields take the defaults of the Update Footprints dialog when lib_id is unset and of the
+// Change Footprints dialog when it is set.
+// Since: 11.0
+message ExchangeFootprintsOptions
+{
+  // Move and rotate the new footprint so that its pads land on the pads of the old one
+  // (default: true)
+  optional bool match_pad_positions = 1;
+
+  // Delete texts that exist on the board footprint but not in the library one
+  // (default: false)
+  optional bool delete_extra_texts = 2;
+
+  // Reset the layers of the footprint texts (default: false when updating, true when changing)
+  optional bool reset_text_layers = 3;
+
+  // Reset the size, thickness, style and justification of the footprint texts
+  // (default: false when updating, true when changing)
+  optional bool reset_text_effects = 4;
+
+  // Reset the positions of the footprint texts (default: false when updating, true when changing)
+  optional bool reset_text_positions = 5;
+
+  // Reset the contents of the footprint texts (default: false when updating, true when changing)
+  optional bool reset_text_content = 6;
+
+  // Reset the fabrication attributes (default: false when updating, true when changing)
+  optional bool reset_fabrication_attributes = 7;
+
+  // Reset the clearance, mask, paste and zone connection overrides
+  // (default: true)
+  optional bool reset_clearance_overrides = 8;
+
+  // Take the 3D models, extruded bodies and embedded model files from the library
+  // (default: true)
+  optional bool reset_3d_models = 9;
+
+  // Reset the scale of the footprint (default: false when updating, true when changing)
+  optional bool reset_transform = 10;
+}
+
+// Replaces footprints on the board with the library definition, like the Update Footprints and
+// Change Footprints dialogs of the PCB editor: the position, orientation, side, lock state, reference,
+// value, UUIDs, nets of matching pads, groups and sheet links of each footprint are kept.
+// The library is re-read from disk first when it has changed since it was last loaded.
+// Returns ExchangeFootprintsResponse
+// Since: 11.0
+message ExchangeFootprints
+{
+  kiapi.common.types.ItemHeader header = 1;
+
+  // The footprints to replace
+  repeated kiapi.common.types.KIID footprints = 2;
+
+  // If set, the footprints are changed to this library footprint (Change Footprints).  If unset,
+  // each footprint is updated from the library footprint it already refers to (Update Footprints).
+  kiapi.common.types.LibraryIdentifier lib_id = 3;
+
+  ExchangeFootprintsOptions options = 4;
+
+  // Report what would change without changing anything
+  bool dry_run = 5;
+}
+
+// Since: 11.0
+enum FootprintExchangeStatus
+{
+  FES_UNKNOWN = 0;
+
+  // The footprint was replaced (or would be, for a dry run)
+  FES_UPDATED = 1;
+
+  // Only the position or angle of the footprint changed, to match its pads to the library
+  FES_SHIFTED = 2;
+
+  // The footprint already matches the library definition (update mode only)
+  FES_UNCHANGED = 3;
+
+  // The library footprint could not be found or loaded; see the message
+  FES_NOT_FOUND = 4;
+
+  // The item does not exist on the board or is not a footprint
+  FES_NONEXISTENT = 5;
+}
+
+// Since: 11.0
+message FootprintExchangeResult
+{
+  // The footprint, as requested.  The UUID is kept by the exchange.
+  kiapi.common.types.KIID footprint = 1;
+
+  FootprintExchangeStatus status = 2;
+
+  // The library footprint that was used
+  kiapi.common.types.LibraryIdentifier lib_id = 3;
+
+  // The differences found (dry run and update mode), or the reason for a failure
+  string message = 4;
+
+  // The footprint after the exchange (not set for a dry run or a failure)
+  google.protobuf.Any item = 5;
+}
+
+// Since: 11.0
+message ExchangeFootprintsResponse
+{
+  kiapi.common.types.ItemHeader header = 1;
+
+  repeated FootprintExchangeResult results = 2;
+}
+
 // What items to use to calculate the board bounding box
 // Since: 11.0
 enum BoardBoundingBoxMode

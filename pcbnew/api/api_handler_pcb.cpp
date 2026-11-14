@@ -43,6 +43,7 @@
 #include <core/kicad_algo.h>
 #include <footprint.h>
 #include <footprint_library_adapter.h>
+#include <footprint_utils.h>
 #include <kicad_clipboard.h>
 #include <netinfo.h>
 #include <pad.h>
@@ -84,6 +85,7 @@
 #include <plotters/plotter_png.h>
 #include <jobs/job_pcb_render.h>
 #include <layer_ids.h>
+#include <libraries/library_manager.h>
 #include <netlist_reader/board_netlist_updater.h>
 #include <netlist_reader/pcb_netlist.h>
 #include <project.h>
@@ -245,6 +247,8 @@ API_HANDLER_PCB::API_HANDLER_PCB( std::shared_ptr<PCB_CONTEXT> aContext, PCB_EDI
 
     registerHandler<PlaceFootprintFromLibrary, PlaceFromLibraryResponse>(
             &API_HANDLER_PCB::handlePlaceFootprintFromLibrary );
+    registerHandler<ExchangeFootprints, ExchangeFootprintsResponse>(
+            &API_HANDLER_PCB::handleExchangeFootprints );
 }
 
 
@@ -4164,6 +4168,110 @@ API_HANDLER_PCB::handleGetCurrentVariant( const HANDLER_CONTEXT<GetCurrentVarian
 }
 
 
+namespace
+{
+
+/**
+ * Load a footprint from the project's footprint libraries to place or exchange on a board.
+ *
+ * The footprint library adapter hands out preloaded copies, so a library that changed on disk
+ * since it was loaded (for example because a client just edited a .kicad_mod file) is refreshed first.
+ *
+ * @param aError receives the reason when nothing could be loaded.
+ */
+std::unique_ptr<FOOTPRINT> loadLibraryFootprint( BOARD* aBoard, const LIB_ID& aId, wxString* aError )
+{
+    FOOTPRINT_LIBRARY_ADAPTER* adapter = PROJECT_PCB::FootprintLibAdapter( nullptr /* ignored */ );
+    const wxString             nickname = aId.GetLibNickname();
+
+    if( !adapter )
+    {
+        *aError = _( "the footprint libraries are not available" );
+        return nullptr;
+    }
+
+    if( !nickname.IsEmpty() )
+    {
+        try
+        {
+            std::optional<LIB_STATUS> status = adapter->GetLibraryStatus( nickname );
+
+            if( status && status->load_status == LOAD_STATUS::LOADED )
+                adapter->RefreshLibraryIfChanged( nickname );
+            else
+                status = adapter->LoadLibraryEntry( nickname );
+
+            if( !status )
+            {
+                *aError = wxString::Format( _( "library '%s' is not in the footprint library tables" ), nickname );
+                return nullptr;
+            }
+
+            if( status->load_status == LOAD_STATUS::LOAD_ERROR )
+            {
+                *aError = wxString::Format( _( "library '%s' could not be loaded: %s" ), nickname,
+                                            status->error ? status->error->message : wxString( wxS( "?" ) ) );
+                return nullptr;
+            }
+        }
+        catch( const IO_ERROR& e )
+        {
+            *aError = wxString::Format( _( "library '%s' could not be read: %s" ), nickname, e.What() );
+            return nullptr;
+        }
+    }
+
+    std::unique_ptr<FOOTPRINT> footprint( LoadFootprintFromProject( aBoard, aId ) );
+
+    if( !footprint )
+        *aError = _( "the library does not contain the footprint" );
+
+    return footprint;
+}
+
+
+/// The ExchangeFootprints options with the defaults of the Update Footprints or Change Footprints dialog.
+struct EXCHANGE_FLAGS
+{
+    bool matchPadPositions;
+    bool deleteExtraTexts;
+    bool resetTextLayers;
+    bool resetTextEffects;
+    bool resetTextPositions;
+    bool resetTextContent;
+    bool resetFabricationAttrs;
+    bool resetClearanceOverrides;
+    bool reset3DModels;
+    bool resetTransform;
+};
+
+
+EXCHANGE_FLAGS resolveExchangeFlags( const ExchangeFootprintsOptions& aOptions, bool aChangeMode )
+{
+    return {
+        aOptions.has_match_pad_positions() ? aOptions.match_pad_positions() : true,
+        aOptions.has_delete_extra_texts() ? aOptions.delete_extra_texts() : false,
+        aOptions.has_reset_text_layers() ? aOptions.reset_text_layers() : aChangeMode,
+        aOptions.has_reset_text_effects() ? aOptions.reset_text_effects() : aChangeMode,
+        aOptions.has_reset_text_positions() ? aOptions.reset_text_positions() : aChangeMode,
+        aOptions.has_reset_text_content() ? aOptions.reset_text_content() : aChangeMode,
+        aOptions.has_reset_fabrication_attributes() ? aOptions.reset_fabrication_attributes() : aChangeMode,
+        aOptions.has_reset_clearance_overrides() ? aOptions.reset_clearance_overrides() : true,
+        aOptions.has_reset_3d_models() ? aOptions.reset_3d_models() : true,
+        aOptions.has_reset_transform() ? aOptions.reset_transform() : aChangeMode
+    };
+}
+
+
+/// True when the 3D models that a reset would take from the library differ from those of the board footprint
+bool modelsDiffer( const FOOTPRINT& aExisting, const FOOTPRINT& aNew )
+{
+    return aExisting.Models() != aNew.Models() || aExisting.Bodies().size() != aNew.Bodies().size();
+}
+
+} // namespace
+
+
 HANDLER_RESULT<PlaceFromLibraryResponse>
 API_HANDLER_PCB::handlePlaceFootprintFromLibrary( const HANDLER_CONTEXT<PlaceFootprintFromLibrary>& aCtx )
 {
@@ -4201,13 +4309,15 @@ API_HANDLER_PCB::handlePlaceFootprintFromLibrary( const HANDLER_CONTEXT<PlaceFoo
         return tl::unexpected( e );
     }
 
-    std::unique_ptr<FOOTPRINT> footprint( LoadFootprintFromProject( board(), libId ) );
+    wxString                   loadError;
+    std::unique_ptr<FOOTPRINT> footprint( loadLibraryFootprint( board(), libId, &loadError ) );
 
     if( !footprint )
     {
         ApiResponseStatus e;
         e.set_status( ApiStatusCode::AS_BAD_REQUEST );
-        e.set_error_message( fmt::format( "footprint '{}' not found", libId.Format().wx_str() ) );
+        e.set_error_message( fmt::format( "footprint '{}' not found: {}", libId.Format().wx_str(),
+                                          loadError.ToStdString() ) );
         return tl::unexpected( e );
     }
 
@@ -4238,6 +4348,183 @@ API_HANDLER_PCB::handlePlaceFootprintFromLibrary( const HANDLER_CONTEXT<PlaceFoo
     PlaceFromLibraryResponse response;
     response.mutable_header()->CopyFrom( aCtx.Request.header() );
     placed->Serialize( *response.mutable_item() );
+
+    return response;
+}
+
+
+HANDLER_RESULT<ExchangeFootprintsResponse>
+API_HANDLER_PCB::handleExchangeFootprints( const HANDLER_CONTEXT<ExchangeFootprints>& aCtx )
+{
+    if( !validateItemHeaderDocument( aCtx.Request.header() ) )
+    {
+        ApiResponseStatus e;
+        e.set_status( ApiStatusCode::AS_UNHANDLED );
+        return tl::unexpected( e );
+    }
+
+    if( std::optional<ApiResponseStatus> busy = checkForBusy() )
+        return tl::unexpected( *busy );
+
+    if( aCtx.Request.footprints_size() == 0 )
+    {
+        ApiResponseStatus e;
+        e.set_status( ApiStatusCode::AS_BAD_REQUEST );
+        e.set_error_message( "footprints must list at least one footprint" );
+        return tl::unexpected( e );
+    }
+
+    const bool changeMode = aCtx.Request.has_lib_id();
+    LIB_ID     changeId;
+
+    if( changeMode )
+    {
+        changeId = UnpackLibId( aCtx.Request.lib_id() );
+
+        if( !changeId.IsValid() )
+        {
+            ApiResponseStatus e;
+            e.set_status( ApiStatusCode::AS_BAD_REQUEST );
+            e.set_error_message( "lib_id must specify both a library nickname and an entry name" );
+            return tl::unexpected( e );
+        }
+    }
+
+    const EXCHANGE_FLAGS flags = resolveExchangeFlags( aCtx.Request.options(), changeMode );
+    const bool           dryRun = aCtx.Request.dry_run();
+
+    const FLIP_DIRECTION flipDirection =
+            frame() ? frame()->GetPcbNewSettings()->m_FlipDirection : FLIP_DIRECTION::TOP_BOTTOM;
+
+    BOARD_COMMIT* commit = nullptr;
+    std::set<KIID> done;
+
+    ExchangeFootprintsResponse response;
+    response.mutable_header()->CopyFrom( aCtx.Request.header() );
+
+    for( const kiapi::common::types::KIID& id : aCtx.Request.footprints() )
+    {
+        FootprintExchangeResult* result = response.add_results();
+        result->mutable_footprint()->set_value( id.value() );
+
+        KIID        kiid( id.value() );
+        BOARD_ITEM* item = board()->ResolveItem( kiid, true );
+
+        // A footprint that an earlier exchange of this client's open commit already replaced has been
+        // staged for removal but is still on the board until the commit is pushed
+        if( !item || item->Type() != PCB_FOOTPRINT_T || !done.insert( kiid ).second )
+        {
+            result->set_status( FootprintExchangeStatus::FES_NONEXISTENT );
+            result->set_message( item ? "not a footprint, or listed more than once" : "no such item" );
+            continue;
+        }
+
+        if( m_commits.contains( aCtx.ClientName ) )
+        {
+            COMMIT* open = m_commits.at( aCtx.ClientName ).second.get();
+
+            if( open->GetStatus( item ) & CHT_REMOVE )
+            {
+                result->set_status( FootprintExchangeStatus::FES_NONEXISTENT );
+                result->set_message( "the footprint is already replaced in the open commit" );
+                continue;
+            }
+        }
+
+        FOOTPRINT*   existing = static_cast<FOOTPRINT*>( item );
+        const LIB_ID libId = changeMode ? changeId : existing->GetFPID();
+
+        PackLibId( result->mutable_lib_id(), libId );
+
+        wxString                   loadError;
+        std::unique_ptr<FOOTPRINT> newFootprint;
+
+        if( libId.IsValid() )
+            newFootprint = loadLibraryFootprint( board(), libId, &loadError );
+        else
+            loadError = _( "the footprint is not linked to a library footprint" );
+
+        if( !newFootprint )
+        {
+            result->set_status( FootprintExchangeStatus::FES_NOT_FOUND );
+            result->set_message( loadError.ToUTF8() );
+            continue;
+        }
+
+        // Expand the footprint pad layers like the netlist updater does
+        newFootprint->FixUpPadsForBoard( board() );
+
+        // What the exchange would change
+        WX_STRING_REPORTER differences;
+        bool               updated = !changeMode;
+        bool               shifted = false;
+
+        if( !changeMode )
+        {
+            updated = existing->FootprintNeedsUpdate( newFootprint.get(), 0, &differences );
+
+            if( flags.reset3DModels && modelsDiffer( *existing, *newFootprint ) )
+            {
+                differences.Report( _( "3D models differ." ) );
+                updated = true;
+            }
+        }
+        else
+        {
+            updated = true;
+        }
+
+        if( flags.matchPadPositions )
+        {
+            VECTOR2I  posShift;
+            EDA_ANGLE angleShift = ANGLE_0;
+
+            if( ComputeFootprintShift( *existing, *newFootprint, posShift, angleShift )
+                && ( posShift != VECTOR2I( 0, 0 ) || angleShift != ANGLE_0 ) )
+            {
+                shifted = true;
+                differences.Report( _( "The footprint would be shifted or rotated to match the pad positions." ) );
+            }
+        }
+
+        result->set_message( differences.GetMessages().ToUTF8() );
+
+        if( dryRun || ( !changeMode && !updated && !shifted ) )
+        {
+            if( updated )
+                result->set_status( FootprintExchangeStatus::FES_UPDATED );
+            else if( shifted )
+                result->set_status( FootprintExchangeStatus::FES_SHIFTED );
+            else
+                result->set_status( FootprintExchangeStatus::FES_UNCHANGED );
+
+            continue;
+        }
+
+        if( !commit )
+            commit = static_cast<BOARD_COMMIT*>( getCurrentCommit( aCtx.ClientName ) );
+
+        FOOTPRINT* replacement = newFootprint.release();
+
+        board()->ExchangeFootprint( existing, replacement, *commit, flipDirection, flags.matchPadPositions,
+                                    flags.deleteExtraTexts, flags.resetTextLayers, flags.resetTextEffects,
+                                    flags.resetTextPositions, flags.resetTextContent, flags.resetFabricationAttrs,
+                                    flags.resetClearanceOverrides, flags.reset3DModels, flags.resetTransform,
+                                    &updated, &shifted );
+
+        if( updated )
+            result->set_status( FootprintExchangeStatus::FES_UPDATED );
+        else if( shifted )
+            result->set_status( FootprintExchangeStatus::FES_SHIFTED );
+        else
+            result->set_status( FootprintExchangeStatus::FES_UNCHANGED );
+
+        replacement->Serialize( *result->mutable_item() );
+    }
+
+    if( commit && !m_activeClients.contains( aCtx.ClientName ) )
+        pushCurrentCommit( aCtx.ClientName, changeMode ? _( "Changed footprints via API" )
+                                                       : _( "Updated footprints via API" ) );
 
     return response;
 }

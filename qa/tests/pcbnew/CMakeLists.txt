@@ -79,6 +79,7 @@ set( QA_PCBNEW_SRCS
     test_footprint_import_reconciler.cpp
     test_import_design_rules.cpp
     test_footprint_library_adapter.cpp
+    test_pcb_api_exchange_footprints.cpp
     test_pcb_api_libraries.cpp
     test_footprint_load_save.cpp
     test_footprint_net_tie.cpp
