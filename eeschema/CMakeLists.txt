@@ -550,6 +550,7 @@ set( EESCHEMA_SRCS
     api/api_sch_utils.cpp
     api/api_handler_sch_libraries.cpp
     api/api_handler_sch.cpp
+    api/api_handler_sch_change_symbols.cpp
     api/api_handler_sch_paste.cpp
     api/api_handler_sch_tasks.cpp
     api/api_handler_symbol.cpp

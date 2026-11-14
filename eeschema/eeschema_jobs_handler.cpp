@@ -249,6 +249,17 @@ SCHEMATIC* EESCHEMA_JOBS_HANDLER::getSchematic( const wxString& aPath, bool aReq
             schPath = path.GetFullPath();
         }
 
+        if( SCHEMATIC* open = m_openSchematic ? *m_openSchematic : nullptr; open && open->RootScreen() )
+        {
+            wxFileName openFile( open->RootScreen()->GetFileName() );
+            wxFileName wanted( schPath );
+            openFile.MakeAbsolute();
+            wanted.MakeAbsolute();
+
+            if( openFile.SameAs( wanted ) )
+                return open;
+        }
+
         if( m_cliSchematic && aRequireRoot && !m_cliSchematicRootValidated )
             ClearCachedSchematic();
 

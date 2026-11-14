@@ -917,7 +917,9 @@ message ExchangeFootprintsOptions
 
 // Replaces footprints on the board with the library definition, like the Update Footprints and
 // Change Footprints dialogs of the PCB editor: the position, orientation, side, lock state, reference,
-// value, UUIDs, nets of matching pads, groups and sheet links of each footprint are kept.
+// UUIDs, nets of matching pads, groups and sheet links of each footprint are kept, and so is the value
+// unless it is the name of the old footprint.  When updating, a footprint without a library nickname
+// is looked for in every library.
 // The library is re-read from disk first when it has changed since it was last loaded.
 // Returns ExchangeFootprintsResponse
 // Since: 11.0
@@ -934,7 +936,9 @@ message ExchangeFootprints
 
   ExchangeFootprintsOptions options = 4;
 
-  // Report what would change without changing anything
+  // Report what would change without changing anything.  A dry run compares the board footprints with
+  // the library; changes made to a footprint on the board that a text or transform reset would undo
+  // are not reported.
   bool dry_run = 5;
 }
 

@@ -94,6 +94,16 @@ public:
     void ClearCachedSchematic();
 
     /**
+     * Run the jobs on a schematic's file on that schematic when it is open elsewhere (in the API
+     * server), instead of on a copy loaded from the file: a copy misses the changes made since the
+     * file was saved or since the copy was loaded.
+     *
+     * @param aSlot where the open schematic is kept (null while none is open); it is not owned and
+     *              the schematic in it may be replaced, for example by a revert.
+     */
+    void SetOpenSchematic( SCHEMATIC* const* aSlot ) { m_openSchematic = aSlot; }
+
+    /**
      * Configure the SCH_RENDER_SETTINGS object with the correct data to be used with plotting.
      *
      * It's sort of a kludge due to the plotter depending on this object normally managed by
@@ -119,6 +129,7 @@ private:
 
     SCHEMATIC* m_cliSchematic;
     bool       m_cliSchematicRootValidated = false;
+    SCHEMATIC* const* m_openSchematic = nullptr;
 };
 
 #endif

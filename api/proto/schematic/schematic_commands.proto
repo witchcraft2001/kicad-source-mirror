@@ -24,6 +24,7 @@ package kiapi.schematic.commands;
 import "common/types/base_types.proto";
 import "common/types/enums.proto";
 import "schematic/schematic_types.proto";
+import "google/protobuf/any.proto";
 
 
 message GetSchematicHierarchy
@@ -207,4 +208,132 @@ message AnnotationChange
 message AnnotateSchematicResponse
 {
   repeated AnnotationChange changes = 1;
+}
+
+// Which parts of a symbol are reset to the library definition by ChangeSymbols.  Every flag that is
+// not set takes the default of the Update Symbols or Change Symbols dialog of the schematic editor.
+// Since: 11.0
+message ChangeSymbolsOptions
+{
+  // The fields to update from the library, by their untranslated names.  Empty means every field
+  // except Reference and Value, as in the dialog.  Listing "Reference" gives the symbol the
+  // reference prefix of the library symbol and keeps its number where it is free.
+  repeated string fields = 1;
+
+  // Remove the fields that the library symbol does not have (default: false)
+  optional bool remove_extra_fields = 2;
+
+  // Clear the text of the updated fields that are empty in the library (default: false)
+  optional bool reset_empty_fields = 3;
+
+  // Take the text of the updated fields from the library (default: true)
+  optional bool reset_field_text = 4;
+
+  // Take the value of a power symbol from the library too (default: false)
+  optional bool reset_custom_power_value = 5;
+
+  // Reset the visibility of the updated fields (default: false when updating, true when changing)
+  optional bool reset_field_visibilities = 6;
+
+  // Reset the text size, style and justification of the updated fields
+  // (default: false when updating, true when changing)
+  optional bool reset_field_effects = 7;
+
+  // Reset the positions of the updated fields (default: false when updating, true when changing)
+  optional bool reset_field_positions = 8;
+
+  // Reset the exclude from simulation, BOM, board and position files attributes
+  // (default: false when updating, true when changing)
+  optional bool reset_attributes = 9;
+
+  // Reset the visibility of pin names and numbers (default: false when updating, true when changing)
+  optional bool reset_pin_text_visibility = 10;
+
+  // Clear the alternate pin functions (default: false when updating, true when changing)
+  optional bool reset_alternate_pins = 11;
+
+  // Clear the pin map overrides (default: false when updating, true when changing)
+  optional bool reset_pin_map_overrides = 12;
+}
+
+// Since: 11.0
+message SymbolChange
+{
+  // A placed symbol.  Each unit of a multi-unit symbol is its own item.
+  kiapi.common.types.KIID symbol = 1;
+
+  // The unit this item shows after the change.  If unset, the unit is kept.
+  optional int32 unit = 2;
+}
+
+// Replaces the library symbol of placed symbols, like the Update Symbols from Library and Change
+// Symbols dialogs of the schematic editor.  The UUID, position, orientation, unit, reference and
+// per-sheet instance data of each symbol are kept; pins are matched to the new symbol by number
+// and keep their UUIDs.  Wires, labels, junctions and no-connect flags are not moved: a pin that
+// sits somewhere else in the new symbol is left unconnected.  A symbol on a sheet that is used
+// more than once is shared by all those sheets.
+// Returns ChangeSymbolsResponse
+// Since: 11.0
+message ChangeSymbols
+{
+  kiapi.common.types.ItemHeader header = 1;
+
+  repeated SymbolChange symbols = 2;
+
+  // If set, the symbols are changed to this library symbol (Change Symbols); refused while a design
+  // variant is active.  If unset, each symbol is updated from the library symbol it already refers
+  // to (Update Symbols from Library).
+  kiapi.common.types.LibraryIdentifier lib_id = 3;
+
+  ChangeSymbolsOptions options = 4;
+
+  // Report what would change without changing anything
+  bool dry_run = 5;
+}
+
+// Since: 11.0
+enum SymbolChangeStatus
+{
+  SCS_UNKNOWN = 0;
+
+  // The symbol was changed (or would be, for a dry run)
+  SCS_CHANGED = 1;
+
+  // Nothing about the symbol would change: it already is what the update or change makes it
+  SCS_UNCHANGED = 2;
+
+  // The library symbol could not be found or loaded; see the message
+  SCS_NOT_FOUND = 3;
+
+  // The item does not exist, is not a symbol, or is listed more than once
+  SCS_NONEXISTENT = 4;
+
+  // The library symbol has fewer units than the symbol needs
+  SCS_TOO_FEW_UNITS = 5;
+}
+
+// Since: 11.0
+message SymbolChangeResult
+{
+  kiapi.common.types.KIID symbol = 1;
+  SymbolChangeStatus status = 2;
+
+  // The library symbol the symbol refers to after the change
+  kiapi.common.types.LibraryIdentifier lib_id = 3;
+
+  // What went wrong, or notes such as other units of the same reference that were not listed
+  string message = 4;
+
+  // The reference of the symbol on each sheet it is used on, after the change
+  repeated string references = 5;
+
+  // The symbol after the change (not set for a dry run or a failure)
+  google.protobuf.Any item = 6;
+}
+
+// Since: 11.0
+message ChangeSymbolsResponse
+{
+  kiapi.common.types.ItemHeader header = 1;
+  repeated SymbolChangeResult results = 2;
 }

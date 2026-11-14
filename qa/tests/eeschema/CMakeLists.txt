@@ -232,6 +232,7 @@ set( QA_EESCHEMA_SRCS
     test_incremental_netlister.cpp
     test_legacy_power_symbols.cpp
     test_history_autosave_legacy.cpp
+    test_sch_api_change_symbols.cpp
     test_sch_api_enums.cpp
     test_sch_api_handler.cpp
     test_sch_api_libraries.cpp

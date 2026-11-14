@@ -4177,20 +4177,24 @@ namespace
  * The footprint library adapter hands out preloaded copies, so a library that changed on disk
  * since it was loaded (for example because a client just edited a .kicad_mod file) is refreshed first.
  *
+ * A footprint without a library nickname (from an old board) is looked for in every library.
+ *
  * @param aError receives the reason when nothing could be loaded.
+ * @param aChecked if given, the libraries already checked for changes in this request; each is checked once.
  */
-std::unique_ptr<FOOTPRINT> loadLibraryFootprint( BOARD* aBoard, const LIB_ID& aId, wxString* aError )
+std::unique_ptr<FOOTPRINT> loadLibraryFootprint( BOARD* aBoard, const LIB_ID& aId, wxString* aError,
+                                                 std::set<wxString>* aChecked = nullptr )
 {
     FOOTPRINT_LIBRARY_ADAPTER* adapter = PROJECT_PCB::FootprintLibAdapter( nullptr /* ignored */ );
     const wxString             nickname = aId.GetLibNickname();
 
     if( !adapter )
     {
-        *aError = _( "the footprint libraries are not available" );
+        *aError = wxS( "the footprint libraries are not available" );
         return nullptr;
     }
 
-    if( !nickname.IsEmpty() )
+    if( !nickname.IsEmpty() && ( !aChecked || aChecked->insert( nickname ).second ) )
     {
         try
         {
@@ -4203,20 +4207,21 @@ std::unique_ptr<FOOTPRINT> loadLibraryFootprint( BOARD* aBoard, const LIB_ID& aI
 
             if( !status )
             {
-                *aError = wxString::Format( _( "library '%s' is not in the footprint library tables" ), nickname );
+                *aError = wxString::Format( wxS( "library '%s' is not in the footprint library tables" ),
+                                            nickname );
                 return nullptr;
             }
 
             if( status->load_status == LOAD_STATUS::LOAD_ERROR )
             {
-                *aError = wxString::Format( _( "library '%s' could not be loaded: %s" ), nickname,
+                *aError = wxString::Format( wxS( "library '%s' could not be loaded: %s" ), nickname,
                                             status->error ? status->error->message : wxString( wxS( "?" ) ) );
                 return nullptr;
             }
         }
         catch( const IO_ERROR& e )
         {
-            *aError = wxString::Format( _( "library '%s' could not be read: %s" ), nickname, e.What() );
+            *aError = wxString::Format( wxS( "library '%s' could not be read: %s" ), nickname, e.What() );
             return nullptr;
         }
     }
@@ -4224,7 +4229,7 @@ std::unique_ptr<FOOTPRINT> loadLibraryFootprint( BOARD* aBoard, const LIB_ID& aI
     std::unique_ptr<FOOTPRINT> footprint( LoadFootprintFromProject( aBoard, aId ) );
 
     if( !footprint )
-        *aError = _( "the library does not contain the footprint" );
+        *aError = wxS( "the library does not contain the footprint" );
 
     return footprint;
 }
@@ -4317,7 +4322,7 @@ API_HANDLER_PCB::handlePlaceFootprintFromLibrary( const HANDLER_CONTEXT<PlaceFoo
         ApiResponseStatus e;
         e.set_status( ApiStatusCode::AS_BAD_REQUEST );
         e.set_error_message( fmt::format( "footprint '{}' not found: {}", libId.Format().wx_str(),
-                                          loadError.ToStdString() ) );
+                                          loadError.ToUTF8().data() ) );
         return tl::unexpected( e );
     }
 
@@ -4396,8 +4401,14 @@ API_HANDLER_PCB::handleExchangeFootprints( const HANDLER_CONTEXT<ExchangeFootpri
     const FLIP_DIRECTION flipDirection =
             frame() ? frame()->GetPcbNewSettings()->m_FlipDirection : FLIP_DIRECTION::TOP_BOTTOM;
 
-    BOARD_COMMIT* commit = nullptr;
-    std::set<KIID> done;
+    // The resets of what was changed on the board footprint itself, which FootprintNeedsUpdate does not
+    // compare with the library: with any of them set every footprint is exchanged, as the dialog does
+    const bool resetsInstance = flags.deleteExtraTexts || flags.resetTextLayers || flags.resetTextEffects
+                                || flags.resetTextPositions || flags.resetTextContent || flags.resetTransform;
+
+    BOARD_COMMIT*      commit = nullptr;
+    std::set<KIID>     done;
+    std::set<wxString> checkedLibraries;
 
     ExchangeFootprintsResponse response;
     response.mutable_header()->CopyFrom( aCtx.Request.header() );
@@ -4410,15 +4421,22 @@ API_HANDLER_PCB::handleExchangeFootprints( const HANDLER_CONTEXT<ExchangeFootpri
         KIID        kiid( id.value() );
         BOARD_ITEM* item = board()->ResolveItem( kiid, true );
 
-        // A footprint that an earlier exchange of this client's open commit already replaced has been
-        // staged for removal but is still on the board until the commit is pushed
-        if( !item || item->Type() != PCB_FOOTPRINT_T || !done.insert( kiid ).second )
+        if( !item || item->Type() != PCB_FOOTPRINT_T )
         {
             result->set_status( FootprintExchangeStatus::FES_NONEXISTENT );
-            result->set_message( item ? "not a footprint, or listed more than once" : "no such item" );
+            result->set_message( item ? "not a footprint" : "no such item" );
             continue;
         }
 
+        if( !done.insert( kiid ).second )
+        {
+            result->set_status( FootprintExchangeStatus::FES_NONEXISTENT );
+            result->set_message( "listed more than once" );
+            continue;
+        }
+
+        // A footprint that an earlier exchange of this client's open commit already replaced has been
+        // staged for removal but is still on the board until the commit is pushed
         if( m_commits.contains( aCtx.ClientName ) )
         {
             COMMIT* open = m_commits.at( aCtx.ClientName ).second.get();
@@ -4439,10 +4457,10 @@ API_HANDLER_PCB::handleExchangeFootprints( const HANDLER_CONTEXT<ExchangeFootpri
         wxString                   loadError;
         std::unique_ptr<FOOTPRINT> newFootprint;
 
-        if( libId.IsValid() )
-            newFootprint = loadLibraryFootprint( board(), libId, &loadError );
+        if( libId.IsValid() || libId.IsLegacy() )
+            newFootprint = loadLibraryFootprint( board(), libId, &loadError, &checkedLibraries );
         else
-            loadError = _( "the footprint is not linked to a library footprint" );
+            loadError = wxS( "the footprint is not linked to a library footprint" );
 
         if( !newFootprint )
         {
@@ -4451,7 +4469,8 @@ API_HANDLER_PCB::handleExchangeFootprints( const HANDLER_CONTEXT<ExchangeFootpri
             continue;
         }
 
-        // Expand the footprint pad layers like the netlist updater does
+        // Expand the footprint pad layers like the netlist updater does.  The dialog leaves this to the
+        // next load of the board, which does the same
         newFootprint->FixUpPadsForBoard( board() );
 
         // What the exchange would change
@@ -4465,7 +4484,7 @@ API_HANDLER_PCB::handleExchangeFootprints( const HANDLER_CONTEXT<ExchangeFootpri
 
             if( flags.reset3DModels && modelsDiffer( *existing, *newFootprint ) )
             {
-                differences.Report( _( "3D models differ." ) );
+                differences.Report( wxS( "3D models differ." ) );
                 updated = true;
             }
         }
@@ -4483,13 +4502,15 @@ API_HANDLER_PCB::handleExchangeFootprints( const HANDLER_CONTEXT<ExchangeFootpri
                 && ( posShift != VECTOR2I( 0, 0 ) || angleShift != ANGLE_0 ) )
             {
                 shifted = true;
-                differences.Report( _( "The footprint would be shifted or rotated to match the pad positions." ) );
+                differences.Report( wxS( "The footprint would be shifted or rotated to match the pad positions." ) );
             }
         }
 
         result->set_message( differences.GetMessages().ToUTF8() );
 
-        if( dryRun || ( !changeMode && !updated && !shifted ) )
+        // Without instance resets a footprint that matches its library is left alone, so that no empty
+        // change is recorded for it
+        if( dryRun || ( !changeMode && !updated && !shifted && !resetsInstance ) )
         {
             if( updated )
                 result->set_status( FootprintExchangeStatus::FES_UPDATED );

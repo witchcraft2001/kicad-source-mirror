@@ -23,6 +23,7 @@
 #include <qa_utils/wx_utils/unit_test_utils.h>
 
 #include <cli/exit_codes.h>
+#include <eeschema_helpers.h>
 #include <eeschema_jobs_handler.h>
 #include <jobs/job_export_bom.h>
 #include <jobs/job_export_sch_netlist.h>
@@ -31,11 +32,18 @@
 #include <jobs/job_sch_erc.h>
 #include <kiway.h>
 #include <locale_io.h>
+#include <pgm_base.h>
 #include <reporter.h>
+#include <sch_screen.h>
+#include <sch_symbol.h>
+#include <schematic.h>
+#include <settings/settings_manager.h>
 
 #include <wx/filename.h>
 
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 
 
 // A schematic PDF job whose output is a folder names the file after the schematic
@@ -123,4 +131,92 @@ BOOST_AUTO_TEST_CASE( SchJobsOutputFolderGetDefaultName )
             BOOST_CHECK_MESSAGE( fs::is_regular_file( outputDir.Path() / expected ), reporter.GetMessages() );
         }
     }
+}
+
+
+namespace
+{
+
+std::string readFile( const std::filesystem::path& aPath )
+{
+    std::ifstream in( aPath );
+    return std::string( std::istreambuf_iterator<char>( in ), std::istreambuf_iterator<char>() );
+}
+
+} // namespace
+
+
+// The API server keeps a schematic open and edits it; a job on its file must see those edits,
+// not a copy loaded from the file (which also stays cached after the first job)
+BOOST_AUTO_TEST_CASE( SchJobsUseTheOpenSchematic )
+{
+    LOCALE_IO dummy;
+
+    namespace fs = std::filesystem;
+
+    KI_TEST::SCOPED_TEMP_DIR dir( wxS( "kicad_sch_open_job" ) );
+
+    fs::path source = fs::path( KI_TEST::GetTestDataRootDir() ) / "eeschema" / "issue24217" / "issue24217.kicad_sch";
+    fs::copy_file( source, dir.Path() / "issue24217.kicad_sch" );
+    wxString schPath = wxString::FromUTF8( ( dir.Path() / "issue24217.kicad_sch" ).string().c_str() );
+
+    SETTINGS_MANAGER& mgr = Pgm().GetSettingsManager();
+    mgr.LoadProject( wxString::FromUTF8( ( dir.Path() / "issue24217.kicad_pro" ).string().c_str() ) );
+    PROJECT* project = &mgr.Prj();
+
+    SCHEMATIC* open = EESCHEMA_HELPERS::LoadSchematic( schPath, false, false, project );
+    BOOST_REQUIRE( open );
+
+    // An edit made after the file was saved
+    SCH_SYMBOL* edited = nullptr;
+
+    for( SCH_ITEM* item : open->RootScreen()->Items().OfType( SCH_SYMBOL_T ) )
+    {
+        SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+
+        if( symbol->GetField( FIELD_T::VALUE )->GetText() == wxS( "6k2" ) )
+            edited = symbol;
+    }
+
+    BOOST_REQUIRE( edited );
+    edited->SetValueFieldText( wxS( "API_EDIT" ) );
+
+    EESCHEMA_JOBS_HANDLER handler( nullptr );
+    WX_STRING_REPORTER    reporter;
+    handler.SetReporter( &reporter );
+
+    auto exportNetlist =
+            [&]( const std::string& aName ) -> std::string
+            {
+                JOB_EXPORT_SCH_NETLIST job;
+                job.m_filename = schPath;
+                job.format = JOB_EXPORT_SCH_NETLIST::FORMAT::KICADSEXPR;
+                job.SetConfiguredOutputPath( wxString::FromUTF8( ( dir.Path() / aName ).string().c_str() ) );
+                BOOST_REQUIRE_EQUAL( handler.JobExportNetlist( &job ), CLI::EXIT_CODES::OK );
+                return readFile( dir.Path() / aName );
+            };
+
+    // With nothing open in the API server the job reads the file
+    SCHEMATIC* none = nullptr;
+    handler.SetOpenSchematic( &none );
+    std::string fromFile = exportNetlist( "file.net" );
+    BOOST_CHECK( fromFile.find( "6k2" ) != std::string::npos );
+
+    // With the schematic open, the job sees the unsaved edit
+    handler.SetOpenSchematic( &open );
+    std::string fromOpen = exportNetlist( "open.net" );
+    BOOST_CHECK( fromOpen.find( "API_EDIT" ) != std::string::npos );
+    BOOST_CHECK( fromOpen.find( "\"6k2\"" ) == std::string::npos );
+
+    // A schematic replaced in its slot (a revert) is the one used next
+    SCHEMATIC* reverted = EESCHEMA_HELPERS::LoadSchematic( schPath, false, false, project );
+    BOOST_REQUIRE( reverted );
+    std::swap( open, reverted );
+    BOOST_CHECK( exportNetlist( "reverted.net" ).find( "6k2" ) != std::string::npos );
+
+    handler.SetOpenSchematic( nullptr );
+    handler.ClearCachedSchematic();
+    delete open;
+    delete reverted;
+    mgr.UnloadProject( project, false );
 }

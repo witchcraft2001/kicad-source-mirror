@@ -30,6 +30,7 @@
 #include <libraries/library_manager.h>
 #include <netinfo.h>
 #include <pad.h>
+#include <pcb_field.h>
 #include <pgm_base.h>
 #include <project_pcb.h>
 #include <settings/settings_manager.h>
@@ -38,6 +39,7 @@
 #include <wx/filefn.h>
 #include <wx/filename.h>
 #include <wx/textfile.h>
+#include <wx/utils.h>
 
 #include <chrono>
 #include <filesystem>
@@ -65,7 +67,8 @@ struct API_EXCHANGE_FOOTPRINTS_FIXTURE
     {
         std::error_code ec;
         m_dir = std::filesystem::temp_directory_path( ec )
-                / std::filesystem::path( wxString::Format( wxS( "kicad_qa_apixfp_%p" ), (void*) this ).ToStdString() );
+                / std::filesystem::path( wxString::Format( wxS( "kicad_qa_apixfp_%lu_%p" ), wxGetProcessId(),
+                                                           (void*) this ).ToStdString() );
         std::filesystem::create_directories( m_dir / "Resistor_SMD.pretty", ec );
 
         wxFileName source( wxString::FromUTF8( KI_TEST::GetTestDataRootDir() ), wxEmptyString );
@@ -153,6 +156,12 @@ struct API_EXCHANGE_FOOTPRINTS_FIXTURE
     /// Replace the model of R_0603_1608Metric in the library on disk and make its timestamp move forward
     void editLibraryModel()
     {
+        editLibrary( "${KICAD8_3DMODEL_DIR}/Resistor_SMD.3dshapes/R_0603_1608Metric.wrl", NEW_MODEL );
+    }
+
+    /// Replace the first occurrence of aOld in R_0603_1608Metric on disk and move its timestamp forward
+    void editLibrary( const std::string& aOld, const std::string& aNew )
+    {
         std::filesystem::path file = m_dir / "Resistor_SMD.pretty" / "R_0603_1608Metric.kicad_mod";
 
         std::string text;
@@ -161,10 +170,9 @@ struct API_EXCHANGE_FOOTPRINTS_FIXTURE
             text.assign( std::istreambuf_iterator<char>( in ), std::istreambuf_iterator<char>() );
         }
 
-        const std::string old = "${KICAD8_3DMODEL_DIR}/Resistor_SMD.3dshapes/R_0603_1608Metric.wrl";
-        size_t            at = text.find( old );
+        size_t at = text.find( aOld );
         BOOST_REQUIRE( at != std::string::npos );
-        text.replace( at, old.size(), NEW_MODEL );
+        text.replace( at, aOld.size(), aNew );
 
         {
             std::ofstream out( file, std::ios::trunc );
@@ -373,10 +381,20 @@ BOOST_AUTO_TEST_CASE( ExchangeFootprintsKeepsBoardModelsWhenAsked )
     ExchangeFootprintsOptions options;
     options.set_reset_3d_models( false );
 
-    const KIID r1Id = m_r1->m_Uuid;
-    exchange( { m_r1 }, nullptr, false, &options );
+    // The library gets a new model and a wider pad, so the footprint is really exchanged
+    editLibraryModel();
+    editLibrary( "(size 0.8 0.95)", "(size 0.9 0.95)" );
+
+    const KIID                 r1Id = m_r1->m_Uuid;
+    FOOTPRINT*                 old = m_r1;
+    ExchangeFootprintsResponse kept = exchange( { m_r1 }, nullptr, false, &options );
+    BOOST_CHECK_EQUAL( kept.results( 0 ).status(), FootprintExchangeStatus::FES_UPDATED );
+    BOOST_CHECK_MESSAGE( kept.results( 0 ).message().find( "3D models differ" ) == std::string::npos,
+                         kept.results( 0 ).message() );
 
     FOOTPRINT* r1 = byUuid( r1Id );
+    BOOST_CHECK( r1 != old );
+    BOOST_CHECK_CLOSE( r1->FindPadByNumber( wxS( "1" ) )->GetSize( F_Cu ).x, 900000.0, 1e-6 );
     BOOST_REQUIRE_EQUAL( r1->Models().size(), 1u );
     BOOST_CHECK_EQUAL( r1->Models().front().m_Filename, own.m_Filename );
     BOOST_CHECK_CLOSE( r1->Models().front().m_Offset.x, 1.5, 1e-9 );
@@ -387,8 +405,50 @@ BOOST_AUTO_TEST_CASE( ExchangeFootprintsKeepsBoardModelsWhenAsked )
     BOOST_CHECK_EQUAL( response.results( 0 ).status(), FootprintExchangeStatus::FES_UPDATED );
     FOOTPRINT* again = byUuid( r1Id );
     BOOST_REQUIRE_EQUAL( again->Models().size(), 1u );
-    BOOST_CHECK_EQUAL( again->Models().front().m_Filename,
-                       wxS( "${KICAD8_3DMODEL_DIR}/Resistor_SMD.3dshapes/R_0603_1608Metric.wrl" ) );
+    BOOST_CHECK_EQUAL( again->Models().front().m_Filename, wxString::FromUTF8( NEW_MODEL ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( ExchangeFootprintsResetsWhatWasChangedOnTheBoard )
+{
+    // The reference of R1 was moved on the board; the library did not change
+    PCB_FIELD&     reference = m_r1->Reference();
+    const VECTOR2I libraryPos = reference.GetFPRelativePosition();
+    reference.SetFPRelativePosition( libraryPos + VECTOR2I( 2000000, 0 ) );
+
+    const KIID r1Id = m_r1->m_Uuid;
+
+    // An update with the defaults keeps the moved text and records nothing
+    ExchangeFootprintsResponse plain = exchange( { m_r1 } );
+    BOOST_CHECK_EQUAL( plain.results( 0 ).status(), FootprintExchangeStatus::FES_UNCHANGED );
+    BOOST_CHECK( byUuid( r1Id ) == m_r1 );
+
+    // Asked to reset the text positions, it puts the reference back where the library has it
+    ExchangeFootprintsOptions options;
+    options.set_reset_text_positions( true );
+
+    ExchangeFootprintsResponse reset = exchange( { m_r1 }, nullptr, false, &options );
+    BOOST_CHECK_EQUAL( reset.results( 0 ).status(), FootprintExchangeStatus::FES_UPDATED );
+
+    FOOTPRINT* r1 = byUuid( r1Id );
+    BOOST_CHECK( r1->Reference().GetFPRelativePosition() == libraryPos );
+    BOOST_CHECK_EQUAL( r1->GetReference(), wxS( "R1" ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( ExchangeFootprintsFindsFootprintsWithoutNickname )
+{
+    // A footprint of an old board names no library: it is looked for in every library
+    m_r1->SetFPID( LIB_ID( wxEmptyString, wxS( "R_0603_1608Metric" ) ) );
+
+    ExchangeFootprintsOptions options;
+    options.set_reset_text_positions( true );
+
+    ExchangeFootprintsResponse response = exchange( { m_r1 }, nullptr, false, &options );
+    BOOST_REQUIRE_EQUAL( response.results_size(), 1 );
+    BOOST_CHECK_MESSAGE( response.results( 0 ).status() != FootprintExchangeStatus::FES_NOT_FOUND,
+                         response.results( 0 ).message() );
+    BOOST_CHECK( response.results( 0 ).has_item() );
 }
 
 
@@ -411,6 +471,8 @@ BOOST_AUTO_TEST_CASE( ExchangeFootprintsReportsPerItemFailures )
             wxFileName( m_board->GetFileName() ).GetFullName().ToStdString() );
     command.add_footprints()->set_value( KIID().AsStdString() );
     command.add_footprints()->set_value( m_r1->Pads().front()->m_Uuid.AsStdString() );
+    command.add_footprints()->set_value( m_r1->m_Uuid.AsStdString() );
+    command.add_footprints()->set_value( m_r1->m_Uuid.AsStdString() );
 
     kiapi::common::ApiRequest req;
     req.mutable_header()->set_client_name( "kicad.qa" );
@@ -420,9 +482,14 @@ BOOST_AUTO_TEST_CASE( ExchangeFootprintsReportsPerItemFailures )
     API_RESULT      result = handler.Handle( req );
     BOOST_REQUIRE( result.has_value() );
     BOOST_REQUIRE( result->message().UnpackTo( &response ) );
-    BOOST_REQUIRE_EQUAL( response.results_size(), 2 );
+    BOOST_REQUIRE_EQUAL( response.results_size(), 4 );
     BOOST_CHECK_EQUAL( response.results( 0 ).status(), FootprintExchangeStatus::FES_NONEXISTENT );
+    BOOST_CHECK_EQUAL( response.results( 0 ).message(), "no such item" );
     BOOST_CHECK_EQUAL( response.results( 1 ).status(), FootprintExchangeStatus::FES_NONEXISTENT );
+    BOOST_CHECK_EQUAL( response.results( 1 ).message(), "not a footprint" );
+    BOOST_CHECK_EQUAL( response.results( 2 ).status(), FootprintExchangeStatus::FES_UNCHANGED );
+    BOOST_CHECK_EQUAL( response.results( 3 ).status(), FootprintExchangeStatus::FES_NONEXISTENT );
+    BOOST_CHECK_EQUAL( response.results( 3 ).message(), "listed more than once" );
 
     // Nothing was touched
     BOOST_CHECK_EQUAL( m_board->Footprints().size(), 2u );

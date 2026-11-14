@@ -212,6 +212,9 @@ private:
 
     HANDLER_RESULT<kiapi::common::commands::PlaceFromLibraryResponse> handlePlaceSymbolFromLibrary(
             const HANDLER_CONTEXT<kiapi::schematic::commands::PlaceSymbolFromLibrary>& aCtx );
+
+    HANDLER_RESULT<kiapi::schematic::commands::ChangeSymbolsResponse>
+    handleChangeSymbols( const HANDLER_CONTEXT<kiapi::schematic::commands::ChangeSymbols>& aCtx );
     HANDLER_RESULT<kiapi::common::tasks::StartTaskResponse> handleStartErcTask(
             const HANDLER_CONTEXT<kiapi::schematic::tasks::StartErcTask>& aCtx );
 

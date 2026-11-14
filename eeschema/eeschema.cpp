@@ -895,6 +895,9 @@ bool IFACE::OnKifaceStart( PGM_BASE* aProgram, int aCtlBits, KIWAY* aKiway )
 
     m_jobHandler = std::make_unique<EESCHEMA_JOBS_HANDLER>( aKiway );
 
+    // Jobs run through the API server act on the schematic it has open, not on a stale file copy
+    m_jobHandler->SetOpenSchematic( &m_openSchematic );
+
     if( m_start_flags & KFCTL_CLI )
     {
         m_jobHandler->SetReporter( &CLI_REPORTER::GetInstance() );
