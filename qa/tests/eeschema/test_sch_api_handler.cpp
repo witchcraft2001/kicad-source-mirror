@@ -49,6 +49,8 @@
 #include <sch_pin.h>
 #include <sch_sheet.h>
 #include <sch_symbol.h>
+#include <sch_text.h>
+#include <sch_bus_entry.h>
 #include <set>
 #include <scoped_set_reset.h>
 
@@ -1665,5 +1667,304 @@ BOOST_AUTO_TEST_CASE( PastePackageRejectsIncompleteHierarchyWithoutMutation )
     BOOST_CHECK( !result.has_value() );
     BOOST_CHECK_EQUAL( root.LastScreen()->Items().size(), before );
 }
+
+
+BOOST_AUTO_TEST_CASE( LayoutGeometryReportsNativeBodiesFieldsAndDrawingSheet )
+{
+    using namespace kiapi::schematic::commands;
+    SCHEMATIC* model = loadSchematic( wxS( "api_kitchen_sink" ) );
+    model->RootScreen()->Append( new SCH_TEXT( VECTOR2I( 1000000, 1000000 ),
+                                             wxS( "Layout note ${PROJECTNAME}" ) ) );
+    API_HANDLER_SCH handler( m_context );
+    GetSchematicLayoutGeometry command;
+    *command.mutable_document() = makeDocument( *model );
+    kiapi::common::ApiRequest request;
+    request.mutable_header()->set_client_name( "kicad.qa" );
+    BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+    auto result = handler.Handle( request );
+    BOOST_REQUIRE( result.has_value() );
+    SchematicLayoutGeometryResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+    BOOST_CHECK_EQUAL( response.sheets_size(), model->Hierarchy().size() );
+    std::set<std::string> kinds;
+
+    for( const auto& sheet : response.sheets() )
+    {
+        BOOST_CHECK_GT( sheet.page().size().x_nm(), 0 );
+        BOOST_CHECK_GT( sheet.page().size().y_nm(), 0 );
+        BOOST_CHECK( !sheet.file().empty() );
+
+        for( const auto& element : sheet.elements() )
+        {
+            kinds.insert( element.kind() );
+            BOOST_CHECK_GE( element.box().size().x_nm(), 0 );
+            BOOST_CHECK_GE( element.box().size().y_nm(), 0 );
+
+            if( element.kind() == "field" )
+                BOOST_CHECK( !element.key().empty() );
+        }
+    }
+
+    BOOST_CHECK( kinds.count( "body" ) );
+    BOOST_CHECK( kinds.count( "pin" ) );
+    BOOST_CHECK( kinds.count( "field" ) );
+    BOOST_CHECK( kinds.count( "text" ) );
+    BOOST_CHECK( kinds.count( "drawing_sheet" ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( LayoutRejectsWrongResultAndRestoresDirtyState )
+{
+    using namespace kiapi::schematic::commands;
+    SCHEMATIC* model = loadSchematic( wxS( "api_kitchen_sink" ) );
+    API_HANDLER_SCH handler( m_context );
+    auto call = [&]( const auto& command )
+    {
+        kiapi::common::ApiRequest request;
+        request.mutable_header()->set_client_name( "kicad.qa.layout" );
+        BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+        return handler.Handle( request );
+    };
+    auto capture = [&]()
+    {
+        GetSchematicLayoutGeometry command;
+        *command.mutable_document() = makeDocument( *model );
+        auto result = call( command );
+        BOOST_REQUIRE( result.has_value() );
+        SchematicLayoutGeometryResponse geometry;
+        BOOST_REQUIRE( result->message().UnpackTo( &geometry ) );
+        return geometry;
+    };
+    auto before = capture();
+    SCH_SHEET_PATH path;
+    SCH_SYMBOL* symbol = firstMultiPinSymbol( *model, path );
+    BOOST_REQUIRE( symbol );
+    const bool dirty = path.LastScreen()->IsContentModified();
+    const auto originalPage = path.LastScreen()->GetPageSettings().GetType();
+    ApplySchematicLayout command;
+    *command.mutable_document() = makeDocument( *model );
+    command.set_expected_revision( before.revision() );
+    command.set_expected_project_revision( before.project_revision() );
+    command.set_result_revision( "not-the-verified-result" );
+    auto* sheet = command.add_sheets();
+    PackSheetPath( *sheet->mutable_path(), path );
+    sheet->mutable_page()->set_page_size( kiapi::common::types::PS_A2 );
+    auto* move = sheet->add_moves();
+    move->mutable_item()->set_value( symbol->m_Uuid.AsStdString() );
+    move->mutable_offset()->set_x_nm( 12700000 );
+    schematic::types::SchematicLine wire;
+    wire.mutable_id()->set_value( KIID().AsStdString() );
+    wire.set_type( schematic::types::SLT_WIRE );
+    wire.mutable_start()->set_x_nm( 10000000 );
+    wire.mutable_start()->set_y_nm( 10000000 );
+    wire.mutable_end()->set_x_nm( 20000000 );
+    wire.mutable_end()->set_y_nm( 10000000 );
+    BOOST_REQUIRE( sheet->add_create_items()->PackFrom( wire ) );
+    auto rejected = call( command );
+    BOOST_REQUIRE( !rejected.has_value() );
+    BOOST_CHECK_EQUAL( capture().revision(), before.revision() );
+    BOOST_CHECK_EQUAL( path.LastScreen()->IsContentModified(), dirty );
+    BOOST_CHECK( path.LastScreen()->GetPageSettings().GetType() == originalPage );
+    BOOST_CHECK( !model->Hierarchy().ResolveItem( KIID( wire.id().value() ), nullptr, true ) );
+
+    command.clear_result_revision();
+    command.set_evaluate( true );
+    auto result = call( command );
+    BOOST_REQUIRE( result.has_value() );
+    ApplySchematicLayoutResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+    BOOST_CHECK( response.revision() != before.revision() );
+    BOOST_CHECK_EQUAL( response.revision(), capture().revision() );
+    BOOST_CHECK( path.LastScreen()->GetPageSettings().GetType() == PAGE_SIZE_TYPE::A2 );
+}
+
+
+BOOST_AUTO_TEST_CASE( LayoutRejectsLockedItemsAndRevisionConflicts )
+{
+    using namespace kiapi::schematic::commands;
+    SCHEMATIC* model = loadSchematic( wxS( "api_kitchen_sink" ) );
+    API_HANDLER_SCH handler( m_context );
+    SCH_SHEET_PATH path;
+    SCH_SYMBOL* symbol = firstMultiPinSymbol( *model, path );
+    BOOST_REQUIRE( symbol );
+    symbol->SetLocked( true );
+    auto call = [&]( const auto& command )
+    {
+        kiapi::common::ApiRequest request;
+        request.mutable_header()->set_client_name( "kicad.qa.layout" );
+        BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+        return handler.Handle( request );
+    };
+    GetSchematicLayoutGeometry read;
+    *read.mutable_document() = makeDocument( *model );
+    auto result = call( read );
+    BOOST_REQUIRE( result.has_value() );
+    SchematicLayoutGeometryResponse geometry;
+    BOOST_REQUIRE( result->message().UnpackTo( &geometry ) );
+    ApplySchematicLayout command;
+    *command.mutable_document() = makeDocument( *model );
+    command.set_evaluate( true );
+    command.set_expected_revision( geometry.revision() );
+    command.set_expected_project_revision( geometry.project_revision() );
+    auto* changes = command.add_sheets();
+    PackSheetPath( *changes->mutable_path(), path );
+    changes->add_moves()->mutable_item()->set_value( symbol->m_Uuid.AsStdString() );
+    const VECTOR2I position = symbol->GetPosition();
+    BOOST_REQUIRE( !call( command ).has_value() );
+    BOOST_CHECK( symbol->GetPosition() == position );
+    command.clear_sheets();
+    command.set_expected_revision( "stale-revision" );
+    BOOST_REQUIRE( !call( command ).has_value() );
+}
+
+
+BOOST_AUTO_TEST_CASE( LayoutGeometryExcludesHiddenPinText )
+{
+    using namespace kiapi::schematic::commands;
+    SCHEMATIC* model = loadSchematic( wxS( "api_kitchen_sink" ) );
+    API_HANDLER_SCH handler( m_context );
+    SCH_SHEET_PATH path;
+    SCH_SYMBOL* symbol = firstMultiPinSymbol( *model, path );
+    BOOST_REQUIRE( symbol );
+    symbol->SetShowPinNames( false );
+    symbol->SetShowPinNumbers( false );
+    GetSchematicLayoutGeometry read;
+    *read.mutable_document() = makeDocument( *model );
+    kiapi::common::ApiRequest request;
+    request.mutable_header()->set_client_name( "kicad.qa.layout" );
+    BOOST_REQUIRE( request.mutable_message()->PackFrom( read ) );
+    auto result = handler.Handle( request );
+    BOOST_REQUIRE( result.has_value() );
+    SchematicLayoutGeometryResponse geometry;
+    BOOST_REQUIRE( result->message().UnpackTo( &geometry ) );
+
+    for( const auto& sheet : geometry.sheets() )
+        for( const auto& element : sheet.elements() )
+            if( element.owner().value() == symbol->m_Uuid.AsStdString() )
+                BOOST_CHECK( element.kind() != "pin_name" && element.kind() != "pin_number" );
+}
+
+
+BOOST_AUTO_TEST_CASE( LayoutPageUndoImagesSwapTheActualScreenSettings )
+{
+    SCHEMATIC* model = loadSchematic( wxS( "api_kitchen_sink" ) );
+    SCH_SHEET& root = model->Root();
+    PAGE_INFO original = root.GetScreen()->GetPageSettings();
+    root.CaptureLayoutPageForUndo();
+    std::unique_ptr<SCH_SHEET> image( static_cast<SCH_SHEET*>( root.Clone() ) );
+    root.ClearLayoutPageUndo();
+    PAGE_INFO larger( PAGE_SIZE_TYPE::A3 );
+    root.GetScreen()->SetPageSettings( larger );
+    root.SwapItemData( image.get() );
+    BOOST_CHECK( root.GetScreen()->GetPageSettings().GetType() == original.GetType() );
+    root.SwapItemData( image.get() );
+    BOOST_CHECK( root.GetScreen()->GetPageSettings().GetType() == larger.GetType() );
+}
+
+
+BOOST_AUTO_TEST_CASE( LayoutGeometryMeasuresSharedInstanceReferencesAfterRotateAndMirror )
+{
+    using namespace kiapi::schematic::commands;
+    SCHEMATIC* model = loadSchematic( wxS( "api_kitchen_sink" ) );
+    SCH_SHEET_PATH sourcePath;
+    SCH_SYMBOL* source = firstMultiPinSymbol( *model, sourcePath );
+    BOOST_REQUIRE( source );
+    SCH_SCREEN* screen = new SCH_SCREEN( model );
+    auto* symbol = static_cast<SCH_SYMBOL*>( source->Clone() );
+    const_cast<KIID&>( symbol->m_Uuid ) = KIID();
+    symbol->Rotate( symbol->GetPosition(), true );
+    symbol->MirrorHorizontally( symbol->GetPosition().x );
+    screen->Append( symbol );
+    SCH_SHEET_PATH parent = model->Hierarchy().at( 0 );
+    std::vector<SCH_SHEET*> placements;
+
+    for( const wxString& name : { wxS( "LayoutA" ), wxS( "LayoutB" ) } )
+    {
+        auto* sheet = new SCH_SHEET( model );
+        sheet->SetName( name );
+        sheet->SetFileName( wxS( "layout-shared.kicad_sch" ) );
+        sheet->SetScreen( screen );
+        parent.LastScreen()->Append( sheet );
+        placements.push_back( sheet );
+    }
+
+    model->RefreshHierarchy();
+    std::vector<SCH_SHEET_PATH> paths;
+
+    for( SCH_SHEET* placement : placements )
+    {
+        SCH_SHEET_PATH path = parent;
+        path.push_back( placement );
+        paths.push_back( path );
+    }
+
+    symbol->SetRef( &paths[0], wxS( "U1" ) );
+    symbol->SetRef( &paths[1], wxS( "U123456789" ) );
+    API_HANDLER_SCH handler( m_context );
+    GetSchematicLayoutGeometry command;
+    *command.mutable_document() = makeDocument( *model );
+    kiapi::common::ApiRequest request;
+    request.mutable_header()->set_client_name( "kicad.qa.layout" );
+    BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+    auto result = handler.Handle( request );
+    BOOST_REQUIRE( result.has_value() );
+    SchematicLayoutGeometryResponse geometry;
+    BOOST_REQUIRE( result->message().UnpackTo( &geometry ) );
+    std::vector<int64_t> referenceExtents;
+
+    for( const auto& sheet : geometry.sheets() )
+        for( const auto& element : sheet.elements() )
+            if( element.owner().value() == symbol->m_Uuid.AsStdString()
+                && element.kind() == "field" && element.key() == "Reference" )
+            {
+                referenceExtents.push_back( std::max( element.box().size().x_nm(),
+                                                     element.box().size().y_nm() ) );
+            }
+
+    BOOST_REQUIRE_EQUAL( referenceExtents.size(), 2 );
+    BOOST_CHECK( referenceExtents[0] != referenceExtents[1] );
+}
+
+BOOST_AUTO_TEST_CASE( BusToBusSnapshotsPreserveIdentityAndAttributes )
+{
+    SCHEMATIC* model = loadSchematic( wxS( "api_kitchen_sink" ) );
+    SCH_SHEET_PATH path = model->Hierarchy().at( 0 );
+    auto* entry = new SCH_BUS_BUS_ENTRY( VECTOR2I( 25400000, 25400000 ) );
+    const_cast<KIID&>( entry->m_Uuid ) = KIID( "ffffffff-ffff-ffff-ffff-ffffffffffff" );
+    entry->SetSize( VECTOR2I( 1270000, 1270000 ) );
+    entry->SetLocked( true );
+    STROKE_PARAMS stroke = entry->GetStroke();
+    stroke.SetWidth( schIUScale.mmToIU( 0.254 ) );
+    entry->SetStroke( stroke );
+    entry->SetCustomProperty( wxS( "layout-fixture" ), wxS( "preserve" ) );
+    path.LastScreen()->Append( entry );
+    const std::string first = formatItems( *model, path, { entry } );
+    const std::string second = formatItems( *model, path, { entry } );
+    BOOST_CHECK_EQUAL( first, second );
+    BOOST_CHECK( first.find( entry->m_Uuid.AsStdString() ) != std::string::npos );
+    BOOST_CHECK( first.find( "(locked yes)" ) != std::string::npos );
+    BOOST_CHECK( first.find( "(width 0.254)" ) != std::string::npos );
+    BOOST_CHECK( first.find( "layout-fixture" ) != std::string::npos );
+
+    auto fullDocument = [&]()
+    {
+        STRING_FORMATTER formatter;
+        SCH_IO_KICAD_SEXPR plugin;
+        plugin.FormatSchematicToFormatter( &formatter, path.Last(), model );
+        return formatter.GetString();
+    };
+    const std::string original = fullDocument();
+    path.LastScreen()->Remove( entry );
+    std::unique_ptr<SCH_BUS_BUS_ENTRY> removed( entry );
+    auto* canonical = new SCH_LINE( entry->GetPosition(), LAYER_BUS );
+    const_cast<KIID&>( canonical->m_Uuid ) = entry->m_Uuid;
+    canonical->SetEndPoint( entry->GetEnd() );
+    canonical->SetStroke( entry->GetStroke() );
+    canonical->SetLocked( entry->IsLocked() );
+    canonical->SetCustomProperties( entry->GetCustomProperties() );
+    path.LastScreen()->Append( canonical );
+    BOOST_CHECK_EQUAL( original, fullDocument() );
+}
+
 
 BOOST_AUTO_TEST_SUITE_END()

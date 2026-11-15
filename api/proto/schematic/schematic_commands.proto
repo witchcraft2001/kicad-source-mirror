@@ -376,3 +376,65 @@ message SchematicBusAliasesResponse
 {
   repeated SchematicBusAlias aliases = 1;
 }
+
+// Native per-instance geometry. Fields have owner/name keys rather than independent UUIDs.
+message GetSchematicLayoutGeometry
+{
+  kiapi.common.types.DocumentSpecifier document = 1;
+}
+message SchematicLayoutElement
+{
+  kiapi.common.types.KIID owner = 1;
+  string kind = 2;
+  string key = 3;
+  kiapi.common.types.Box2 box = 4;
+  bool fixed = 5;
+}
+message SchematicLayoutSheet
+{
+  kiapi.common.types.SheetPath path = 1;
+  string file = 2;
+  kiapi.common.types.Box2 page = 3;
+  repeated SchematicLayoutElement elements = 4;
+}
+message SchematicLayoutGeometryResponse
+{
+  string revision = 2;
+  string project_revision = 3;
+  map<string, bytes> netclasses = 4;
+  repeated SchematicLayoutSheet sheets = 1;
+}
+
+message SchematicLayoutFieldPosition
+{
+  string name = 1;
+  kiapi.common.types.Vector2 position = 2;
+}
+message SchematicLayoutMove
+{
+  kiapi.common.types.KIID item = 1;
+  kiapi.common.types.Vector2 offset = 2;
+  int32 quarter_turns = 3;
+  repeated SchematicLayoutFieldPosition fields = 4;
+}
+message SchematicLayoutChanges
+{
+  kiapi.common.types.SheetPath path = 1;
+  repeated SchematicLayoutMove moves = 2;
+  repeated kiapi.common.types.KIID delete_items = 3;
+  repeated google.protobuf.Any create_items = 4;
+  optional kiapi.common.types.PageSettings page = 5;
+}
+message ApplySchematicLayout
+{
+  kiapi.common.types.DocumentSpecifier document = 1;
+  string expected_revision = 2;
+  string expected_project_revision = 3;
+  string result_revision = 4;
+  repeated SchematicLayoutChanges sheets = 5;
+  bool evaluate = 6; // Headless candidate evaluation only; GUI application always requires a result hash.
+}
+message ApplySchematicLayoutResponse
+{
+  string revision = 1;
+}

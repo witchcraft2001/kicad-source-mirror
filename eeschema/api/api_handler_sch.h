@@ -56,6 +56,11 @@ public:
     API_HANDLER_SCH( std::shared_ptr<SCH_CONTEXT> aContext, SCH_EDIT_FRAME* aFrame = nullptr );
 
 protected:
+    std::string layoutRevision();
+    HANDLER_RESULT<kiapi::schematic::commands::ApplySchematicLayoutResponse> handleApplyLayout(
+            const HANDLER_CONTEXT<kiapi::schematic::commands::ApplySchematicLayout>& aCtx );
+    HANDLER_RESULT<kiapi::schematic::commands::SchematicLayoutGeometryResponse> handleLayoutGeometry(
+            const HANDLER_CONTEXT<kiapi::schematic::commands::GetSchematicLayoutGeometry>& aCtx );
     HANDLER_RESULT<commands::RunActionResponse> handleHistoryAction(
             const HANDLER_CONTEXT<commands::RunAction>& aCtx );
     HANDLER_RESULT<commands::DocumentStateResponse> handleDocumentState(

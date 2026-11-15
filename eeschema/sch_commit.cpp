@@ -650,7 +650,10 @@ EDA_ITEM* SCH_COMMIT::undoLevelItem( EDA_ITEM* aItem ) const
         return aItem;
     }
 
-    if( parent && parent->IsType( { SCH_SYMBOL_T, SCH_TABLE_T, SCH_SHEET_T, SCH_LABEL_LOCATE_ANY_T } ) )
+    // A top-level sheet is parented to the virtual root, but owns its own Undo state.
+    // Only a sheet's pins/fields should be promoted to their containing sheet symbol.
+    if( parent && aItem->Type() != SCH_SHEET_T
+        && parent->IsType( { SCH_SYMBOL_T, SCH_TABLE_T, SCH_SHEET_T, SCH_LABEL_LOCATE_ANY_T } ) )
         return parent;
 
     return aItem;

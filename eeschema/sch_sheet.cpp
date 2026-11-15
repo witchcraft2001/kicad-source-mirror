@@ -312,6 +312,7 @@ SCH_SHEET::SCH_SHEET( const SCH_SHEET& aSheet ) :
     m_backgroundColor = aSheet.m_backgroundColor;
     m_instances = aSheet.m_instances;
     m_busAliasesUndo = aSheet.m_busAliasesUndo;
+    m_layoutPageUndo = aSheet.m_layoutPageUndo;
 
     for( SCH_SHEET_PIN* pin : aSheet.m_pins )
     {
@@ -629,6 +630,12 @@ bool SCH_SHEET::ResolveTextVar( const SCH_SHEET_PATH* aPath, wxString* token, in
 }
 
 
+void SCH_SHEET::CaptureLayoutPageForUndo()
+{
+    m_layoutPageUndo = GetScreen()->GetPageSettings();
+}
+
+
 void SCH_SHEET::CaptureBusAliasesForUndo()
 {
     m_busAliasesUndo.emplace();
@@ -644,6 +651,13 @@ void SCH_SHEET::swapData( SCH_ITEM* aItem )
                                    aItem->GetClass() ) );
 
     SCH_SHEET* sheet = ( SCH_SHEET* ) aItem;
+
+    if( sheet->m_layoutPageUndo )
+    {
+        PAGE_INFO previous = GetScreen()->GetPageSettings();
+        GetScreen()->SetPageSettings( *sheet->m_layoutPageUndo );
+        sheet->m_layoutPageUndo = previous;
+    }
 
     if( sheet->m_busAliasesUndo )
     {

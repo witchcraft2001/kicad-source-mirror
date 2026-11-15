@@ -113,6 +113,12 @@ HANDLER_RESULT<CapabilitiesResponse> API_HANDLER_COMMON::handleGetCapabilities(
     ( *response.mutable_features() )["zone_locked"] = 1;
     ( *response.mutable_features() )["netclass_line_style"] = 1;
     ( *response.mutable_features() )["schematic_source_package"] = 1;
+    ( *response.mutable_features() )["schematic_layout_geometry"] =
+            commands.contains( "kiapi.schematic.commands.GetSchematicLayoutGeometry" ) ? 2 : 0;
+    ( *response.mutable_features() )["schematic_layout_apply"] =
+            commands.contains( "kiapi.schematic.commands.ApplySchematicLayout" ) ? 1 : 0;
+    ( *response.mutable_features() )["schematic_bus_entry_identity"] =
+            commands.contains( "kiapi.schematic.commands.GetSchematicBuses" ) ? 1 : 0;
     ( *response.mutable_features() )["schematic_bus_graph"] =
             commands.contains( "kiapi.schematic.commands.GetSchematicBuses" ) ? 2 : 0;
     ( *response.mutable_features() )["document_restore"] =

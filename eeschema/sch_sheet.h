@@ -28,6 +28,7 @@
 #include <optional>
 
 #include <sch_field.h>
+#include <page_info.h>
 
 class KIID_PATH;
 class SCH_SCREEN;
@@ -370,6 +371,8 @@ public:
     VECTOR2I GetRotationCenter() const;
 
     // Project alias state carried only by an explicit Undo image, never serialized.
+    void CaptureLayoutPageForUndo();
+    void ClearLayoutPageUndo() { m_layoutPageUndo.reset(); }
     void CaptureBusAliasesForUndo();
     void ClearBusAliasesUndo() { m_busAliasesUndo.reset(); }
 
@@ -667,6 +670,7 @@ public:
 protected:
     friend SCH_SHEET_PATH;
     friend SCH_IO_KICAD_SEXPR_PARSER;
+    std::optional<PAGE_INFO> m_layoutPageUndo;
     std::optional<std::vector<std::pair<wxString, std::vector<wxString>>>> m_busAliasesUndo;
 
     friend SCHEMATIC;          // Only to swap a staged screen in, see SCHEMATIC::AdoptContent().

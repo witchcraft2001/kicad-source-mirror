@@ -47,6 +47,14 @@
 #include <kiway.h>
 #include <plotters/plotter_png.h>
 #include <sch_field.h>
+#include <sch_pin.h>
+#include <sch_text.h>
+#include <pin_layout_cache.h>
+#include <sch_line.h>
+#include <picosha2.h>
+#include <project/net_settings.h>
+#include <netclass.h>
+#include <drawing_sheet/ds_draw_item.h>
 #include <sch_group.h>
 #include <common.h>
 #include <connection_graph.h>
@@ -172,6 +180,12 @@ API_HANDLER_SCH::API_HANDLER_SCH( std::shared_ptr<SCH_CONTEXT> aContext,
             &API_HANDLER_SCH::handleParseAndCreateItemsFromString );
     registerHandler<GetItems, GetItemsResponse>( &API_HANDLER_SCH::handleGetItems );
     registerHandler<GetItemsById, GetItemsResponse>( &API_HANDLER_SCH::handleGetItemsById );
+    registerHandler<kiapi::schematic::commands::ApplySchematicLayout,
+                    kiapi::schematic::commands::ApplySchematicLayoutResponse>(
+            &API_HANDLER_SCH::handleApplyLayout );
+    registerHandler<kiapi::schematic::commands::GetSchematicLayoutGeometry,
+                    kiapi::schematic::commands::SchematicLayoutGeometryResponse>(
+            &API_HANDLER_SCH::handleLayoutGeometry );
     registerHandler<GetBoundingBox, GetBoundingBoxResponse>( &API_HANDLER_SCH::handleGetBoundingBox );
 
     registerHandler<GetSelection, SelectionResponse>( &API_HANDLER_SCH::handleGetSelection );
@@ -4068,5 +4082,490 @@ HANDLER_RESULT<commands::RunActionResponse> API_HANDLER_SCH::handleHistoryAction
         return response;
     }
     response.set_status( commands::RAS_OK );
+    return response;
+}
+
+
+HANDLER_RESULT<kiapi::schematic::commands::SchematicLayoutGeometryResponse>
+API_HANDLER_SCH::handleLayoutGeometry(
+        const HANDLER_CONTEXT<kiapi::schematic::commands::GetSchematicLayoutGeometry>& aCtx )
+{
+    if( auto valid = validateDocument( aCtx.Request.document() ); !valid )
+        return tl::unexpected( valid.error() );
+
+    if( auto busy = checkForBusy() )
+        return tl::unexpected( *busy );
+
+    // Freeze the displayed string; SCH_FIELD otherwise resolves references through the
+    // active path again while computing its text box, which is wrong for shared sheets.
+    class MEASURED_FIELD : public SCH_FIELD
+    {
+    public:
+        MEASURED_FIELD( const SCH_FIELD& source, const wxString& shown ) :
+                SCH_FIELD( source ), m_shown( shown )
+        {
+            ClearCaches();
+        }
+
+        wxString GetShownText( RESOLUTION_CONTEXT, int ) const override { return m_shown; }
+
+    private:
+        wxString m_shown;
+    };
+
+    kiapi::schematic::commands::SchematicLayoutGeometryResponse response;
+    response.set_revision( layoutRevision() );
+    response.set_project_revision( picosha2::hash256_hex_string(
+            context()->Prj().GetProjectFile().CaptureState() ) );
+    const auto hierarchy = schematic()->Hierarchy();
+
+    for( const SCH_SHEET_PATH& path : hierarchy )
+    {
+        if( aCtx.Request.document().has_sheet_path()
+            && path.Path() != UnpackSheetPath( aCtx.Request.document().sheet_path() ) )
+            continue;
+
+        SCH_SCREEN* screen = path.LastScreen();
+        auto* output = response.add_sheets();
+        PackSheetPath( *output->mutable_path(), path );
+        output->set_file( screen->GetFileName().ToUTF8() );
+        const PAGE_INFO& page = screen->GetPageSettings();
+        PackBox2( *output->mutable_page(),
+                  BOX2I( VECTOR2I( 0, 0 ), VECTOR2I( page.GetSizeIU( schIUScale.IU_PER_MILS ) ) ),
+                  schIUScale );
+
+        auto add = [&]( const KIID& owner, const std::string& kind, const wxString& key,
+                        const BOX2I& box, bool fixed )
+        {
+            auto* element = output->add_elements();
+            element->mutable_owner()->set_value( owner.AsStdString() );
+            element->set_kind( kind );
+            element->set_key( key.ToUTF8() );
+            element->set_fixed( fixed );
+            PackBox2( *element->mutable_box(), box, schIUScale );
+        };
+
+        for( SCH_ITEM* item : screen->Items() )
+        {
+            bool fixed = item->IsLocked();
+
+            for( SCH_GROUP* group = dynamic_cast<SCH_GROUP*>( item->GetParentGroup() ); group;
+                 group = dynamic_cast<SCH_GROUP*>( group->GetParentGroup() ) )
+                fixed = fixed || group->IsLocked();
+
+            if( auto* symbol = dynamic_cast<SCH_SYMBOL*>( item ) )
+            {
+                add( item->m_Uuid, "body", wxEmptyString, symbol->GetBodyBoundingBox(), fixed );
+
+                for( const SCH_PIN* pin : symbol->GetPins( &path ) )
+                {
+                    add( item->m_Uuid, "pin", pin->GetNumber(),
+                         pin->GetBoundingBox( false, false, false ), fixed );
+
+                    if( pin->IsVisible() )
+                    {
+                        if( pin->GetLayoutCache().GetPinNameInfo( 0 ) )
+                            if( auto box = pin->GetLayoutCache().GetPinNameBBox() )
+                                add( item->m_Uuid, "pin_name", pin->GetNumber(), *box, fixed );
+
+                        if( pin->GetLayoutCache().GetPinNumberInfo( 0 ) )
+                            if( auto box = pin->GetLayoutCache().GetPinNumberBBox() )
+                                add( item->m_Uuid, "pin_number", pin->GetNumber(), *box, fixed );
+                    }
+                }
+            }
+            else
+            {
+                if( auto* sheet = dynamic_cast<SCH_SHEET*>( item ) )
+                    add( item->m_Uuid, "body", wxEmptyString, sheet->GetBodyBoundingBox(), fixed );
+                else if( auto* label = dynamic_cast<SCH_LABEL_BASE*>( item ) )
+                {
+                    std::unique_ptr<SCH_LABEL_BASE> measured(
+                            static_cast<SCH_LABEL_BASE*>( label->Clone() ) );
+                    measured->SetText( label->GetShownText( &path, FOR_CANVAS ) );
+                    BOX2I box = measured->GetBodyBoundingBox( nullptr );
+
+                    if( label->Type() == SCH_LABEL_T )
+                    {
+                        // A local label's body box also merges its electrical anchor,
+                        // which is outside the glyphs. Measure the text separately so
+                        // an intentional wire at that anchor is not a text collision.
+                        box = measured->GetTextBox( nullptr );
+                        box.Offset( 0, -measured->GetTextOffset() );
+                        box.Inflate( measured->GetEffectiveTextPenWidth() );
+                        VECTOR2I start = box.GetOrigin();
+                        VECTOR2I end = box.GetEnd();
+                        RotatePoint( start, measured->GetTextPos(), measured->GetTextAngle() );
+                        RotatePoint( end, measured->GetTextPos(), measured->GetTextAngle() );
+                        box.SetOrigin( start );
+                        box.SetEnd( end );
+                        box.Normalize();
+                    }
+
+                    add( item->m_Uuid, "label", wxEmptyString, box, fixed );
+                }
+                else if( auto* text = dynamic_cast<SCH_TEXT*>( item ) )
+                {
+                    SCH_TEXT measured( *text );
+                    measured.SetText( text->GetShownText( &path, FOR_CANVAS ) );
+                    add( item->m_Uuid, "text", wxEmptyString, measured.GetBoundingBox(), fixed );
+                }
+                else
+                    add( item->m_Uuid, "item", wxEmptyString, item->GetBoundingBox(), fixed );
+            }
+
+            std::vector<SCH_FIELD*> fields;
+            if( auto* symbol = dynamic_cast<SCH_SYMBOL*>( item ) )
+                symbol->GetFields( fields, true );
+            else if( auto* sheet = dynamic_cast<SCH_SHEET*>( item ) )
+            {
+                for( SCH_FIELD& field : sheet->GetFields() )
+                    if( field.IsVisible() )
+                        fields.push_back( &field );
+            }
+            else if( auto* label = dynamic_cast<SCH_LABEL_BASE*>( item ) )
+            {
+                for( SCH_FIELD& field : label->GetFields() )
+                    if( field.IsVisible() )
+                        fields.push_back( &field );
+            }
+
+            for( SCH_FIELD* field : fields )
+            {
+                // Resolve text in this instance without changing the live field or active sheet.
+                MEASURED_FIELD measured( *field, field->GetShownText(
+                        &path, FOR_CANVAS, schematic()->GetCurrentVariant() ) );
+                add( item->m_Uuid, "field", field->GetName(), measured.GetBoundingBox(),
+                     fixed || !field->CanAutoplace() );
+            }
+        }
+
+        DS_DRAW_ITEM_LIST drawing( schIUScale, FOR_CANVAS );
+        drawing.SetPageNumber( path.GetPageNumber() );
+        drawing.SetSheetCount( hierarchy.size() );
+        drawing.SetFileName( screen->GetFileName() );
+        drawing.SetSheetName( path.Last()->GetName() );
+        drawing.SetSheetPath( path.PathHumanReadable() );
+        drawing.SetIsFirstPage( path.GetVirtualPageNumber() == 1 );
+        drawing.SetProject( &schematic()->Project() );
+        drawing.BuildDrawItemsList( page, screen->GetTitleBlock() );
+
+        for( DS_DRAW_ITEM_BASE* item = drawing.GetFirst(); item; item = drawing.GetNext() )
+            add( niluuid, "drawing_sheet", item->GetClass(), item->GetBoundingBox(), true );
+    }
+
+    HANDLER_CONTEXT<kiapi::schematic::commands::GetSchematicNetlist> netRequest;
+    netRequest.ClientName = aCtx.ClientName;
+    *netRequest.Request.mutable_document() = aCtx.Request.document();
+    netRequest.Request.mutable_document()->clear_sheet_path();
+    netRequest.Request.add_types( kiapi::common::types::KOT_SCH_PIN );
+    auto nets = handleGetSchematicNetlist( netRequest );
+
+    if( !nets )
+        return tl::unexpected( nets.error() );
+
+    for( const auto& net : nets->nets() )
+    {
+        kiapi::common::project::NetClass packed;
+        context()->Prj().GetProjectFile().NetSettings()->GetEffectiveNetClass(
+                wxString::FromUTF8( net.name() ) )->Serialize( packed );
+        ( *response.mutable_netclasses() )[net.name()] = packed.SerializeAsString();
+    }
+
+    kiapi::common::project::NetClass defaultClass;
+    context()->Prj().GetProjectFile().NetSettings()->GetEffectiveNetClass( wxEmptyString )->Serialize( defaultClass );
+    ( *response.mutable_netclasses() )[""] = defaultClass.SerializeAsString();
+    response.set_revision( layoutRevision() );
+    response.set_project_revision( picosha2::hash256_hex_string(
+            context()->Prj().GetProjectFile().CaptureState() ) );
+    return response;
+}
+
+
+std::string API_HANDLER_SCH::layoutRevision()
+{
+    HANDLER_CONTEXT<commands::SaveDocumentToString> capture;
+    capture.ClientName = "layout-revision";
+    std::string contents;
+
+    for( const SCH_SHEET_PATH& path : schematic()->Hierarchy() )
+    {
+        auto* document = capture.Request.mutable_document();
+        document->set_type( DocumentType::DOCTYPE_SCHEMATIC );
+        PackProject( *document->mutable_project(), context()->Prj() );
+        PackSheetPath( *document->mutable_sheet_path(), path );
+        auto saved = handleSaveDocumentToString( capture );
+
+        if( !saved )
+            throw std::runtime_error( "could not capture schematic revision" );
+
+        contents += std::to_string( saved->contents().size() ) + ":" + saved->contents();
+    }
+
+    return picosha2::hash256_hex_string( contents );
+}
+
+
+HANDLER_RESULT<kiapi::schematic::commands::ApplySchematicLayoutResponse>
+API_HANDLER_SCH::handleApplyLayout(
+        const HANDLER_CONTEXT<kiapi::schematic::commands::ApplySchematicLayout>& aCtx )
+{
+    if( auto valid = validateDocument( aCtx.Request.document() ); !valid )
+        return tl::unexpected( valid.error() );
+
+    if( auto busy = checkForBusy() )
+        return tl::unexpected( *busy );
+
+    auto fail = []( const std::string& reason )
+            -> HANDLER_RESULT<kiapi::schematic::commands::ApplySchematicLayoutResponse>
+    {
+        ApiResponseStatus error;
+        error.set_status( ApiStatusCode::AS_BAD_REQUEST );
+        error.set_error_message( reason );
+        return tl::unexpected( error );
+    };
+
+    if( !m_commits.empty() || !m_activeClients.empty() )
+        return fail( "close all edit groups before applying a layout" );
+
+    const auto& request = aCtx.Request;
+
+    if( request.evaluate() && m_frame )
+        return fail( "layout evaluation is restricted to isolated headless copies" );
+
+    if( request.expected_revision().empty() || layoutRevision() != request.expected_revision()
+        || request.expected_project_revision() != picosha2::hash256_hex_string(
+                context()->Prj().GetProjectFile().CaptureState() ) )
+        return fail( "schematic or project settings changed since layout was reviewed" );
+
+    if( request.result_revision().empty() && ( !request.evaluate() || m_frame ) )
+        return fail( "a verified result revision is required" );
+
+    auto hierarchy = schematic()->Hierarchy();
+    std::set<SCH_SCREEN*> screens;
+    std::set<KIID> touched;
+    auto find = []( SCH_SCREEN* screen, const KIID& id ) -> SCH_ITEM*
+    {
+        for( SCH_ITEM* item : screen->Items() )
+            if( item->m_Uuid == id )
+                return item;
+
+        return nullptr;
+    };
+    auto locked = []( SCH_ITEM* item )
+    {
+        if( item->IsLocked() )
+            return true;
+
+        for( auto* group = dynamic_cast<SCH_GROUP*>( item->GetParentGroup() ); group;
+             group = dynamic_cast<SCH_GROUP*>( group->GetParentGroup() ) )
+            if( group->IsLocked() )
+                return true;
+
+        bool childLocked = false;
+        item->RunOnChildren( [&]( SCH_ITEM* child ) { childLocked |= child->IsLocked(); },
+                             RECURSE_MODE::RECURSE );
+        return childLocked;
+    };
+
+    // All addresses and locks are checked before opening the transaction. A shared screen
+    // occurs once even when the hierarchy contains several placements of it.
+    for( const auto& sheet : request.sheets() )
+    {
+        auto path = hierarchy.GetSheetPathByKIIDPath( UnpackSheetPath( sheet.path() ) );
+
+        if( !path || !screens.insert( path->LastScreen() ).second )
+            return fail( "invalid or duplicate shared layout screen" );
+
+        auto check = [&]( const KIID& id ) -> SCH_ITEM*
+        {
+            SCH_ITEM* item = find( path->LastScreen(), id );
+
+            if( !item || locked( item ) || !touched.insert( id ).second )
+                return nullptr;
+
+            return item;
+        };
+
+        for( const auto& move : sheet.moves() )
+        {
+            SCH_ITEM* item = check( KIID( move.item().value() ) );
+
+            if( !item || !item->IsType( { SCH_SYMBOL_T, SCH_SHEET_T, SCH_LABEL_T, SCH_NO_CONNECT_T } )
+                || move.quarter_turns() < -3 || move.quarter_turns() > 3
+                || ( item->Type() == SCH_SHEET_T && move.quarter_turns() != 0 ) )
+                return fail( "layout move references a missing, locked or unsupported item" );
+        }
+
+        for( const auto& id : sheet.delete_items() )
+        {
+            SCH_ITEM* item = check( KIID( id.value() ) );
+            bool wire = item && item->Type() == SCH_LINE_T
+                        && static_cast<SCH_LINE*>( item )->GetLayer() == LAYER_WIRE;
+
+            if( !item || ( !wire && item->Type() != SCH_JUNCTION_T && item->Type() != SCH_LABEL_T ) )
+                return fail( "layout may remove only unlocked wires, junctions and local labels" );
+        }
+
+        for( const auto& any : sheet.create_items() )
+        {
+            auto type = TypeNameFromAny( any );
+
+            if( !type || ( *type != SCH_LINE_T && *type != SCH_JUNCTION_T && *type != SCH_LABEL_T ) )
+                return fail( "layout may create only wires, junctions and local labels" );
+
+            if( *type == SCH_LINE_T )
+            {
+                kiapi::schematic::types::SchematicLine line;
+
+                if( !any.UnpackTo( &line ) || line.type() != kiapi::schematic::types::SLT_WIRE )
+                    return fail( "layout cannot create bus or graphical lines" );
+            }
+        }
+
+        if( sheet.has_page() && ( sheet.page().page_size() == types::PS_UNKNOWN
+                                 || sheet.page().page_size() == types::PS_USER ) )
+            return fail( "layout page format must be a standard paper size" );
+    }
+
+    std::map<SCH_SCREEN*, bool> modifiedBefore;
+
+    for( const auto& path : hierarchy )
+        modifiedBefore.emplace( path.LastScreen(), path.LastScreen()->IsContentModified() );
+
+    SCH_COMMIT* commit = static_cast<SCH_COMMIT*>( getCurrentCommit( aCtx.ClientName ) );
+    m_activeClients.insert( aCtx.ClientName );
+
+    try
+    {
+        // Capture page Undo images before a containing sheet symbol is also moved.
+        for( const auto& sheet : request.sheets() )
+        {
+            if( !sheet.has_page() )
+                continue;
+
+            auto path = hierarchy.GetSheetPathByKIIDPath( UnpackSheetPath( sheet.path() ) );
+            SCH_SHEET* placement = path->Last();
+            placement->CaptureLayoutPageForUndo();
+            SCH_SCREEN* ownerScreen = placement->GetParentScreen();
+            // Top-level sheet objects live on the virtual root screen, not on the
+            // document screen they own. Undo must never append them to their own tree.
+            if( placement->IsTopLevelSheet() )
+                ownerScreen = schematic()->Root().GetScreen();
+            commit->Modify( placement, ownerScreen ? ownerScreen : path->LastScreen() );
+            placement->ClearLayoutPageUndo();
+        }
+
+        for( const auto& sheet : request.sheets() )
+        {
+            auto path = hierarchy.GetSheetPathByKIIDPath( UnpackSheetPath( sheet.path() ) );
+            SCH_SCREEN* screen = path->LastScreen();
+
+            for( const auto& move : sheet.moves() )
+            {
+                SCH_ITEM* item = find( screen, KIID( move.item().value() ) );
+                commit->Modify( item, screen );
+
+                for( int q = 0; q < std::abs( move.quarter_turns() ); ++q )
+                    item->Rotate( item->GetPosition(), move.quarter_turns() > 0 );
+
+                item->Move( UnpackVector2( move.offset(), schIUScale ) );
+                std::vector<SCH_FIELD*> fields;
+
+                if( auto* symbol = dynamic_cast<SCH_SYMBOL*>( item ) )
+                    symbol->GetFields( fields, false );
+                else if( auto* sheetSymbol = dynamic_cast<SCH_SHEET*>( item ) )
+                    for( SCH_FIELD& field : sheetSymbol->GetFields() )
+                        fields.push_back( &field );
+
+                for( const auto& desired : move.fields() )
+                {
+                    auto found = std::find_if( fields.begin(), fields.end(), [&]( SCH_FIELD* field )
+                            { return field->GetName() == wxString::FromUTF8( desired.name() ); } );
+
+                    if( found == fields.end() || !( *found )->CanAutoplace() )
+                        throw std::runtime_error( "layout cannot reposition the requested field" );
+
+                    ( *found )->SetPosition( UnpackVector2( desired.position(), schIUScale ) );
+                }
+
+                screen->Update( item );
+            }
+
+            // Make staged additions/removals visible to serialization and connectivity
+            // before publishing the Undo step. CHT_DONE makes Push/Revert own these edits.
+            for( const auto& id : sheet.delete_items() )
+            {
+                SCH_ITEM* item = find( screen, KIID( id.value() ) );
+                commit->Removed( item, screen );
+                screen->Remove( item );
+
+                if( m_frame && screen == schematic()->GetCurrentScreen() )
+                    m_context->GetToolManager()->GetView()->Remove( item );
+            }
+
+            for( const auto& any : sheet.create_items() )
+            {
+                auto created = createItemForType( *TypeNameFromAny( any ), screen );
+
+                if( !created || !( *created )->Deserialize( any ) )
+                    throw std::runtime_error( "KiCad rejected a layout item" );
+
+                auto* item = static_cast<SCH_ITEM*>( created->get() );
+
+                if( hierarchy.ResolveItem( item->m_Uuid, nullptr, true ) || !touched.insert( item->m_Uuid ).second )
+                    throw std::runtime_error( "layout item UUID already exists" );
+
+                screen->Append( item );
+                commit->Added( item, screen );
+                created->release();
+
+                if( m_frame && screen == schematic()->GetCurrentScreen() )
+                    m_context->GetToolManager()->GetView()->Add( item );
+            }
+
+            if( sheet.has_page() )
+            {
+                PAGE_INFO page( FromProtoEnum<PAGE_SIZE_TYPE>( sheet.page().page_size() ) );
+                page.SetPortrait( sheet.page().orientation() == types::PO_PORTRAIT );
+                screen->SetPageSettings( page );
+                screen->SetContentModified();
+            }
+        }
+
+        schematic()->RebuildConnectivity();
+
+        if( !request.evaluate() && layoutRevision() != request.result_revision() )
+            throw std::runtime_error( "layout does not match the verified proposal" );
+
+
+    }
+    catch( const std::exception& error )
+    {
+        commit->Revert();
+        m_commits.erase( aCtx.ClientName );
+        m_activeClients.erase( aCtx.ClientName );
+        schematic()->RebuildConnectivity();
+        for( const auto& [screen, modified] : modifiedBefore )
+            screen->SetContentModified( modified );
+
+        return fail( error.what() );
+    }
+
+    // The proposal has already been rebuilt and verified. Interactive cleanup would
+    // rewrite its segments after the hash check and could differ between GUI/headless.
+    // Unexpected errors while publishing are not reported as a successful rollback.
+    commit->Push( _( "Automatically laid out schematic" ), SKIP_CONNECTIVITY | DELETE_REMOVED_ITEMS );
+    m_commits.erase( aCtx.ClientName );
+    m_activeClients.erase( aCtx.ClientName );
+    schematic()->RebuildConnectivity();
+
+    if( m_frame )
+    {
+        frame()->GetCanvas()->Refresh();
+    }
+
+    kiapi::schematic::commands::ApplySchematicLayoutResponse response;
+    response.set_revision( layoutRevision() );
     return response;
 }

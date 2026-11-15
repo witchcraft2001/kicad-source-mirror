@@ -484,8 +484,13 @@ void SCH_IO_KICAD_SEXPR::Format( SCH_SHEET* aSheet )
     auto cmp =
             []( const SCH_ITEM* a, const SCH_ITEM* b )
             {
-                if( a->Type() != b->Type() )
-                    return a->Type() < b->Type();
+                // Bus-to-bus entries are stored as bus lines. Use their serialized
+                // type so opening a snapshot does not reorder an unchanged document.
+                KICAD_T aType = a->Type() == SCH_BUS_BUS_ENTRY_T ? SCH_LINE_T : a->Type();
+                KICAD_T bType = b->Type() == SCH_BUS_BUS_ENTRY_T ? SCH_LINE_T : b->Type();
+
+                if( aType != bType )
+                    return aType < bType;
 
                 return a->m_Uuid < b->m_Uuid;
             };
@@ -1462,7 +1467,13 @@ void SCH_IO_KICAD_SEXPR::saveBusEntry( SCH_BUS_ENTRY_BASE* aBusEntry )
     {
         SCH_LINE busEntryLine( aBusEntry->GetPosition(), LAYER_BUS );
 
+        // The file format represents this entry as a bus segment. Preserve its identity
+        // and authored attributes; a fresh temporary UUID makes every read snapshot differ.
+        const_cast<KIID&>( busEntryLine.m_Uuid ) = aBusEntry->m_Uuid;
         busEntryLine.SetEndPoint( aBusEntry->GetEnd() );
+        busEntryLine.SetStroke( aBusEntry->GetStroke() );
+        busEntryLine.SetLocked( aBusEntry->IsLocked() );
+        busEntryLine.SetCustomProperties( aBusEntry->GetCustomProperties() );
         saveLine( &busEntryLine );
         return;
     }
