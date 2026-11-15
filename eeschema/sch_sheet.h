@@ -25,6 +25,7 @@
 #include <memory>
 #include <functional>
 #include <set>
+#include <optional>
 
 #include <sch_field.h>
 
@@ -368,6 +369,10 @@ public:
      */
     VECTOR2I GetRotationCenter() const;
 
+    // Project alias state carried only by an explicit Undo image, never serialized.
+    void CaptureBusAliasesForUndo();
+    void ClearBusAliasesUndo() { m_busAliasesUndo.reset(); }
+
     void swapData( SCH_ITEM* aItem ) override;
 
     /**
@@ -662,6 +667,8 @@ public:
 protected:
     friend SCH_SHEET_PATH;
     friend SCH_IO_KICAD_SEXPR_PARSER;
+    std::optional<std::vector<std::pair<wxString, std::vector<wxString>>>> m_busAliasesUndo;
+
     friend SCHEMATIC;          // Only to swap a staged screen in, see SCHEMATIC::AdoptContent().
 
     void setInstances( const std::vector<SCH_SHEET_INSTANCE>& aInstances )

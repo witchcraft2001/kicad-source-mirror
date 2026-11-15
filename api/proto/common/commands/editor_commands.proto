@@ -508,6 +508,14 @@ message ParseAndCreateItemsFromString
 
   // Added to the position of every created item.  Since: 11.0
   kiapi.common.types.Vector2 offset = 3;
+
+  // Optional complete subsheet package. Keys are project-relative destination filenames;
+  // values are full .kicad_sch contents. Parsed without saving any project documents.
+  map<string, string> schematic_sources = 4;
+
+  // Replace this sheet placement's source instead of adding a placement (SCH only).
+  // Contents must contain exactly one sheet symbol. The placement UUID is retained.
+  kiapi.common.types.KIID replace_sheet = 5;
 }
 
 // Since: 11.0. Prepare parses a detached copy; apply replaces the document in memory.

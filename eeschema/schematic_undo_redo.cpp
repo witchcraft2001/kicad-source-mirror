@@ -252,6 +252,7 @@ void SCH_EDIT_FRAME::PutDataInPreviousState( PICKED_ITEMS_LIST* aList )
     bool                   dirtyConnectivity = false;
     bool                   rebuildHierarchyNavigator = false;
     bool                   refreshHierarchy = false;
+    bool                   refreshBackingScreen = false;
     bool                   refSuffixChanged = false;
     SCH_CLEANUP_FLAGS      connectivityCleanUp = NO_CLEANUP;
     SCH_SHEET_LIST         sheets= m_schematic->Hierarchy();
@@ -412,6 +413,12 @@ void SCH_EDIT_FRAME::PutDataInPreviousState( PICKED_ITEMS_LIST* aList )
                 const auto* originalSheet = static_cast<const SCH_SHEET*>( schItem );
                 const auto* modifiedSheet = static_cast<const SCH_SHEET*>( itemCopy );
                 const bool hierarchyChanged = originalSheet->HasHierarchyChanges( *modifiedSheet );
+                if( originalSheet->GetScreen() != modifiedSheet->GetScreen() )
+                {
+                    const SCH_SHEET_PATH& active = GetCurrentSheet();
+                    for( size_t i = 0; i < active.size(); ++i )
+                        refreshBackingScreen |= active.at( i ) == originalSheet;
+                }
                 rebuildHierarchyNavigator |= hierarchyChanged;
                 refreshHierarchy |= hierarchyChanged;
 
@@ -540,6 +547,22 @@ void SCH_EDIT_FRAME::PutDataInPreviousState( PICKED_ITEMS_LIST* aList )
 
     if( refreshHierarchy )
         Schematic().RefreshHierarchy();
+
+    if( refreshBackingScreen )
+    {
+        m_toolManager->RunAction( ACTIONS::selectionClear );
+        KIID_PATH path = GetCurrentSheet().Path();
+        while( !path.empty() )
+        {
+            if( auto valid = Schematic().Hierarchy().GetSheetPathByKIIDPath( path ) )
+            {
+                SetCurrentSheet( *valid );
+                DisplayCurrentSheet();
+                break;
+            }
+            path.pop_back();
+        }
+    }
 
     // Undo can restore a suffix while one of its child sheets is on screen
     if( refSuffixChanged )

@@ -337,3 +337,42 @@ message ChangeSymbolsResponse
   kiapi.common.types.ItemHeader header = 1;
   repeated SymbolChangeResult results = 2;
 }
+
+// Resolved bus membership from KiCad's connection engine. Optional expression is parsed read-only.
+message GetSchematicBuses
+{
+  kiapi.common.types.DocumentSpecifier document = 1;
+  string expression = 2;
+}
+message SchematicBus
+{
+  kiapi.common.types.KIID item = 1;
+  kiapi.common.types.SheetPath path = 2;
+  string name = 3;
+  repeated string members = 4;
+  // Local declaration names, in the same ordinal order as canonical members.
+  repeated string declaration_members = 5;
+}
+message SchematicBusesResponse
+{
+  repeated SchematicBus buses = 1;
+  repeated string expression_members = 2;
+}
+message SchematicBusAlias
+{
+  string name = 1;
+  repeated string members = 2;
+}
+message GetSchematicBusAliases
+{
+  kiapi.common.types.DocumentSpecifier document = 1;
+}
+message SetSchematicBusAliases
+{
+  kiapi.common.types.DocumentSpecifier document = 1;
+  repeated SchematicBusAlias aliases = 2;
+}
+message SchematicBusAliasesResponse
+{
+  repeated SchematicBusAlias aliases = 1;
+}

@@ -29,6 +29,7 @@
 #include <api/common/commands/base_commands.pb.h>
 #include <api/common/commands/project_commands.pb.h>
 #include <api/common/tasks.pb.h>
+#include <api/schematic/schematic_commands.pb.h>
 
 using namespace kiapi::common;
 using kiapi::common::types::ProjectSpecifier;
@@ -72,6 +73,8 @@ public:
     }
 
 private:
+    HANDLER_RESULT<Empty> handleMirrorSchematicBusAliases(
+            const HANDLER_CONTEXT<kiapi::schematic::commands::SetSchematicBusAliases>& aCtx );
     HANDLER_RESULT<commands::CapabilitiesResponse> handleGetCapabilities(
         const HANDLER_CONTEXT<commands::GetCapabilities>& aCtx );
 

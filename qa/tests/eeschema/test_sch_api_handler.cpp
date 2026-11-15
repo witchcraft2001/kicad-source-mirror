@@ -1578,4 +1578,92 @@ BOOST_AUTO_TEST_CASE( AnnotateSchematicNumbersUnannotatedSymbols )
 }
 
 
+
+BOOST_AUTO_TEST_CASE( BusMembershipAndAliasUndoImages )
+{
+    using namespace kiapi::schematic::commands;
+    SCHEMATIC* model = loadSchematic( wxS( "api_kitchen_sink" ) );
+    API_HANDLER_SCH handler( m_context );
+    auto set = [&]( const std::string& vector )
+    {
+        SetSchematicBusAliases command;
+        *command.mutable_document() = makeDocument( *model );
+        auto* alias = command.add_aliases();
+        alias->set_name( "DATA" );
+        alias->add_members( vector );
+        kiapi::common::ApiRequest request;
+        request.mutable_header()->set_client_name( "kicad.qa" );
+        BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+        auto result = handler.Handle( request );
+        BOOST_REQUIRE( result.has_value() );
+    };
+    auto count = [&]()
+    {
+        GetSchematicBuses command;
+        *command.mutable_document() = makeDocument( *model );
+        command.set_expression( "{DATA}" );
+        kiapi::common::ApiRequest request;
+        request.mutable_header()->set_client_name( "kicad.qa" );
+        BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+        auto result = handler.Handle( request );
+        BOOST_REQUIRE( result.has_value() );
+        SchematicBusesResponse response;
+        BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+        return response.expression_members_size();
+    };
+    set( "D[0..3]" );
+    BOOST_CHECK_EQUAL( count(), 4 );
+    model->Root().CaptureBusAliasesForUndo();
+    std::unique_ptr<SCH_SHEET> image( static_cast<SCH_SHEET*>( model->Root().Clone() ) );
+    model->Root().ClearBusAliasesUndo();
+    set( "D[0..7]" );
+    BOOST_CHECK_EQUAL( count(), 8 );
+    model->Root().SwapItemData( image.get() );
+    BOOST_CHECK_EQUAL( count(), 4 );
+    model->Root().SwapItemData( image.get() );
+    BOOST_CHECK_EQUAL( count(), 8 );
+}
+
+BOOST_AUTO_TEST_CASE( SheetSourceSwapRestoresBackingScreen )
+{
+    SCHEMATIC* model = loadSchematic( wxS( "api_kitchen_sink" ) );
+    SCH_SHEET* sheet = nullptr;
+    for( SCH_ITEM* item : model->RootScreen()->Items().OfType( SCH_SHEET_T ) )
+        sheet = static_cast<SCH_SHEET*>( item );
+    BOOST_REQUIRE( sheet );
+    SCH_SCREEN* original = sheet->GetScreen();
+    std::unique_ptr<SCH_SHEET> image( static_cast<SCH_SHEET*>( sheet->Clone() ) );
+    SCH_SCREEN* replacement = new SCH_SCREEN( model );
+    sheet->SetScreen( replacement );
+    sheet->SwapItemData( image.get() );
+    BOOST_CHECK( sheet->GetScreen() == original );
+    sheet->SwapItemData( image.get() );
+    BOOST_CHECK( sheet->GetScreen() == replacement );
+}
+
+BOOST_AUTO_TEST_CASE( PastePackageRejectsIncompleteHierarchyWithoutMutation )
+{
+    using namespace kiapi::common;
+    SCHEMATIC* model = loadSchematic( wxS( "api_kitchen_sink" ) );
+    SCH_SHEET_PATH root = model->Hierarchy().at( 0 );
+    SCH_SHEET* child = nullptr;
+    for( SCH_ITEM* item : root.LastScreen()->Items().OfType( SCH_SHEET_T ) )
+        child = static_cast<SCH_SHEET*>( item );
+    BOOST_REQUIRE( child );
+    std::string text = formatItems( *model, root, { child } );
+    commands::ParseAndCreateItemsFromString command;
+    *command.mutable_document() = makeDocument( *model );
+    command.set_contents( text );
+    // Even an unused malformed package must be rejected before any live item is touched.
+    ( *command.mutable_schematic_sources() )["invalid.kicad_sch"] = "not a schematic";
+    ApiRequest request;
+    request.mutable_header()->set_client_name( "kicad.qa" );
+    BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+    API_HANDLER_SCH handler( m_context );
+    const size_t before = root.LastScreen()->Items().size();
+    auto result = handler.Handle( request );
+    BOOST_CHECK( !result.has_value() );
+    BOOST_CHECK_EQUAL( root.LastScreen()->Items().size(), before );
+}
+
 BOOST_AUTO_TEST_SUITE_END()

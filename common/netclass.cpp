@@ -202,6 +202,17 @@ void NETCLASS::Serialize( kiapi::common::project::NetClass& nc ) const
                      { *m_ViaDrill, *m_ViaDrill } );
     }
 
+    if( m_uViaDia )
+    {
+        auto* layer = board->mutable_microvia_stack()->add_copper_layers();
+        layer->set_shape( kiapi::board::types::PSS_CIRCLE );
+        layer->set_layer( kiapi::board::types::BL_F_Cu );
+        PackVector2( *layer->mutable_size(), { *m_uViaDia, *m_uViaDia } );
+    }
+    if( m_uViaDrill )
+        PackVector2( *board->mutable_microvia_stack()->mutable_drill()->mutable_diameter(),
+                     { *m_uViaDrill, *m_uViaDrill } );
+
     if( m_pcbColor != COLOR4D::UNSPECIFIED )
         PackColor( *board->mutable_color(), m_pcbColor );
 
@@ -221,9 +232,10 @@ void NETCLASS::Serialize( kiapi::common::project::NetClass& nc ) const
 
     if( m_lineStyle )
     {
-        // TODO(JE) resolve issues with moving to kicommon
-        // schematic->set_line_style( ToProtoEnum<LINE_STYLE, types::StrokeLineStyle>(
-        //         static_cast<LINE_STYLE>( *m_lineStyle ) ) );
+        // Keep kicommon independent of the editor API enum conversion implementation.
+        static_assert( static_cast<int>( LINE_STYLE::DEFAULT ) + 2 == types::SLS_DEFAULT );
+        static_assert( static_cast<int>( LINE_STYLE::DASHDOTDOT ) + 2 == types::SLS_DASHDOTDOT );
+        schematic->set_line_style( static_cast<types::StrokeLineStyle>( *m_lineStyle + 2 ) );
     }
 
 }
@@ -242,6 +254,12 @@ void NETCLASS::Serialize( google::protobuf::Any &aContainer ) const
 bool NETCLASS::Deserialize( const kiapi::common::project::NetClass& nc )
 {
     using namespace kiapi::common;
+
+    if( nc.schematic().has_line_style()
+        && ( nc.schematic().line_style() < types::SLS_DEFAULT
+             || nc.schematic().line_style() > types::SLS_DASHDOTDOT ) )
+        return false;
+
 
 
     m_Name = wxString::FromUTF8( nc.name() );
@@ -277,6 +295,14 @@ bool NETCLASS::Deserialize( const kiapi::common::project::NetClass& nc )
             m_ViaDrill = nc.board().via_stack().drill().diameter().x_nm();
     }
 
+    if( nc.board().has_microvia_stack() )
+    {
+        if( nc.board().microvia_stack().copper_layers_size() > 0 )
+            m_uViaDia = nc.board().microvia_stack().copper_layers( 0 ).size().x_nm();
+        if( nc.board().microvia_stack().has_drill() )
+            m_uViaDrill = nc.board().microvia_stack().drill().diameter().x_nm();
+    }
+
     if( nc.board().has_color() )
         m_pcbColor = UnpackColor( nc.board().color() );
 
@@ -292,9 +318,11 @@ bool NETCLASS::Deserialize( const kiapi::common::project::NetClass& nc )
     if( nc.schematic().has_color() )
         m_schematicColor = UnpackColor( nc.schematic().color() );
 
-    // TODO(JE) resolve issues with moving to kicommon
-    // if( nc.schematic().has_line_style() )
-    //     m_lineStyle = static_cast<int>( FromProtoEnum<LINE_STYLE>( nc.schematic().line_style() ) );
+    if( nc.schematic().has_line_style() )
+    {
+        const int style = nc.schematic().line_style();
+        m_lineStyle = style - 2;
+    }
 
     return true;
 }

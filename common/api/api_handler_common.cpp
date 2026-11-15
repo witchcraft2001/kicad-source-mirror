@@ -67,6 +67,8 @@ API_HANDLER_COMMON::API_HANDLER_COMMON() :
     registerHandler<GetPaths, GetPathsResponse>( &API_HANDLER_COMMON::handleGetPaths );
     registerHandler<GetNetClasses, NetClassesResponse>( &API_HANDLER_COMMON::handleGetNetClasses );
     registerHandler<SetNetClasses, Empty>( &API_HANDLER_COMMON::handleSetNetClasses );
+    registerHandler<kiapi::schematic::commands::SetSchematicBusAliases, Empty>(
+            &API_HANDLER_COMMON::handleMirrorSchematicBusAliases );
     registerHandler<GetNetClassAssignments, NetClassAssignmentsResponse>(
             &API_HANDLER_COMMON::handleGetNetClassAssignments );
     registerHandler<SetNetClassAssignments, Empty>( &API_HANDLER_COMMON::handleSetNetClassAssignments );
@@ -109,6 +111,10 @@ HANDLER_RESULT<CapabilitiesResponse> API_HANDLER_COMMON::handleGetCapabilities(
         response.add_commands( name );
 
     ( *response.mutable_features() )["zone_locked"] = 1;
+    ( *response.mutable_features() )["netclass_line_style"] = 1;
+    ( *response.mutable_features() )["schematic_source_package"] = 1;
+    ( *response.mutable_features() )["schematic_bus_graph"] =
+            commands.contains( "kiapi.schematic.commands.GetSchematicBuses" ) ? 2 : 0;
     ( *response.mutable_features() )["document_restore"] =
             commands.contains( "kiapi.common.commands.DocumentStateRequest" ) ? 1 : 0;
     return response;
@@ -1216,4 +1222,35 @@ HANDLER_RESULT<TransmissionLineResponse> API_HANDLER_COMMON::handleCalculateTran
     }
 
     return response;
+}
+
+HANDLER_RESULT<Empty> API_HANDLER_COMMON::handleMirrorSchematicBusAliases(
+        const HANDLER_CONTEXT<kiapi::schematic::commands::SetSchematicBusAliases>& aCtx )
+{
+    if( aCtx.Request.document().type() != kiapi::common::types::DOCTYPE_PCB )
+    {
+        ApiResponseStatus error;
+        error.set_status( ApiStatusCode::AS_UNHANDLED );
+        return tl::unexpected( error );
+    }
+    if( auto valid = validateProject( aCtx.Request.document().project(), true ); !valid )
+        return tl::unexpected( valid.error() );
+    std::map<wxString, std::vector<wxString>> aliases;
+    for( const auto& entry : aCtx.Request.aliases() )
+    {
+        wxString name = wxString::FromUTF8( entry.name() );
+        if( name.IsEmpty() || aliases.contains( name ) || entry.members().empty() )
+        {
+            ApiResponseStatus error;
+            error.set_status( ApiStatusCode::AS_BAD_REQUEST );
+            error.set_error_message( "invalid bus alias mirror" );
+            return tl::unexpected( error );
+        }
+        for( const auto& member : entry.members() )
+            aliases[name].push_back( wxString::FromUTF8( member ) );
+    }
+    PROJECT_FILE& project = Pgm().GetSettingsManager().Prj().GetProjectFile();
+    project.m_BusAliases = std::move( aliases );
+    project.m_BusAliasesDefined = true;
+    return Empty();
 }

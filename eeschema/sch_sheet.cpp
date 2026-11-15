@@ -311,6 +311,7 @@ SCH_SHEET::SCH_SHEET( const SCH_SHEET& aSheet ) :
     m_borderColor = aSheet.m_borderColor;
     m_backgroundColor = aSheet.m_backgroundColor;
     m_instances = aSheet.m_instances;
+    m_busAliasesUndo = aSheet.m_busAliasesUndo;
 
     for( SCH_SHEET_PIN* pin : aSheet.m_pins )
     {
@@ -628,6 +629,14 @@ bool SCH_SHEET::ResolveTextVar( const SCH_SHEET_PATH* aPath, wxString* token, in
 }
 
 
+void SCH_SHEET::CaptureBusAliasesForUndo()
+{
+    m_busAliasesUndo.emplace();
+    for( const auto& alias : GetScreen()->Schematic()->GetAllBusAliases() )
+        m_busAliasesUndo->emplace_back( alias->GetName(), alias->Members() );
+}
+
+
 void SCH_SHEET::swapData( SCH_ITEM* aItem )
 {
     wxCHECK_RET( aItem->Type() == SCH_SHEET_T,
@@ -636,10 +645,29 @@ void SCH_SHEET::swapData( SCH_ITEM* aItem )
 
     SCH_SHEET* sheet = ( SCH_SHEET* ) aItem;
 
+    if( sheet->m_busAliasesUndo )
+    {
+        auto previous = std::move( *sheet->m_busAliasesUndo );
+        CaptureBusAliasesForUndo();
+        sheet->m_busAliasesUndo = std::move( m_busAliasesUndo );
+        m_busAliasesUndo.reset();
+        std::vector<std::shared_ptr<BUS_ALIAS>> aliases;
+        for( const auto& [name, members] : previous )
+        {
+            auto alias = std::make_shared<BUS_ALIAS>();
+            alias->SetName( name );
+            alias->SetMembers( members );
+            aliases.push_back( alias );
+        }
+        GetScreen()->Schematic()->SetBusAliases( aliases );
+    }
+
+
     std::swap( m_pos, sheet->m_pos );
     std::swap( m_size, sheet->m_size );
     m_fields.swap( sheet->m_fields );
     m_pins.swap( sheet->m_pins );
+    std::swap( m_screen, sheet->m_screen );
 
     // Update parent pointers after swapping.
     for( SCH_SHEET_PIN* sheetPin : m_pins )

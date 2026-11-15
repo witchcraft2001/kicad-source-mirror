@@ -40,6 +40,7 @@
 #include <sch_edit_frame.h>
 #include <sch_group.h>
 #include <sch_io/kicad_sexpr/sch_io_kicad_sexpr.h>
+#include <sch_io/kicad_sexpr/sch_io_kicad_sexpr_parser.h>
 #include <sch_reference_list.h>
 #include <sch_screen.h>
 #include <sch_sheet.h>
@@ -50,9 +51,15 @@
 #include <schematic_settings.h>
 #include <string_utils.h>
 #include <tools/sch_editor_control.h>
+#include <tools/sch_actions.h>
+#include <tool/actions.h>
+#include <tool/tool_manager.h>
 #include <tools/sch_tool_utils.h>
 
 #include <api/common/commands/editor_commands.pb.h>
+#include <api/restore_project.h>
+#include <project/project_file.h>
+#include <functional>
 
 #include <algorithm>
 #include <map>
@@ -281,6 +288,125 @@ HANDLER_RESULT<CreateItemsResponse> API_HANDLER_SCH::handleParseAndCreateItemsFr
 
     tempScreen->MigrateSimModels();
 
+    SCH_SHEET* replacement = nullptr;
+
+    if( !aCtx.Request.replace_sheet().value().empty() )
+    {
+        replacement = dynamic_cast<SCH_SHEET*>( pasteRoot.ResolveItem( KIID( aCtx.Request.replace_sheet().value() ) ) );
+
+        if( !replacement || replacement->IsLocked() || tempScreen->Items().size() != 1
+            || (*tempScreen->Items().begin())->Type() != SCH_SHEET_T )
+            return tl::unexpected( badRequest( "replacement requires one unlocked sheet placement on the target screen" ) );
+    }
+
+    // Package screens are parsed in a detached project: parsing legacy bus aliases must not
+    // mutate the user's settings. No destination file is written by this command.
+    API_RESTORE_PROJECT sourceProject( project().GetProjectFullName() );
+    sourceProject.GetProjectFile().RestoreState( project().GetProjectFile().CaptureState() );
+    SCHEMATIC sourceSchematic( &sourceProject );
+    std::map<wxString, std::unique_ptr<SCH_SHEET>> sourceSheets;
+    std::map<wxString, int> sourceState;
+
+    auto absoluteSource = [&]( const wxString& aName, const wxString& aBase ) -> wxString
+    {
+        wxFileName file( aName );
+        if( !file.Normalize( FN_NORMALIZE_FLAGS | wxPATH_NORM_ENV_VARS, aBase ) )
+            return wxEmptyString;
+        return file.GetFullPath( wxPATH_UNIX );
+    };
+
+    try
+    {
+        for( const auto& [name, contents] : aCtx.Request.schematic_sources() )
+        {
+            wxFileName relative( wxString::FromUTF8( name ) );
+            wxString absolute = absoluteSource( relative.GetFullPath(), project().GetProjectPath() );
+            wxString projectPath = wxFileName::DirName( project().GetProjectPath() ).GetPathWithSep();
+            if( relative.IsAbsolute() || absolute.IsEmpty() || !absolute.StartsWith( projectPath )
+                || relative.GetExt() != wxT( "kicad_sch" ) || sourceSheets.contains( absolute ) )
+                return tl::unexpected( badRequest( "unsafe or duplicate schematic package filename" ) );
+            auto sheet = std::make_unique<SCH_SHEET>();
+            sheet->SetScreen( new SCH_SCREEN( &sourceSchematic ) );
+            STRING_LINE_READER reader( contents, name );
+            SCH_IO_KICAD_SEXPR_PARSER parser( &reader );
+            parser.ParseSchematic( sheet.get() );
+            sheet->SetFileName( absolute );
+            sheet->GetScreen()->SetFileName( absolute );
+            sheet->GetScreen()->UpdateLocalLibSymbolLinks();
+            for( const SCH_SHEET_PATH& existing : hierarchy )
+            {
+                if( existing.LastScreen()->GetFileName() == absolute )
+                    THROW_IO_ERROR( wxT( "package filename is already part of this schematic" ) );
+            }
+            sourceSheets.emplace( absolute, std::move( sheet ) );
+        }
+        std::function<void( const wxString& )> link = [&]( const wxString& name )
+        {
+            if( sourceState[name] == 1 )
+                THROW_IO_ERROR( wxT( "recursive schematic package" ) );
+            if( sourceState[name] == 2 )
+                return;
+            sourceState[name] = 1;
+            SCH_SCREEN* screen = sourceSheets.at( name )->GetScreen();
+            for( SCH_ITEM* item : screen->Items().OfType( SCH_SHEET_T ) )
+            {
+                SCH_SHEET* child = static_cast<SCH_SHEET*>( item );
+                wxString path = absoluteSource( child->GetFileName(), wxFileName( name ).GetPath() );
+                if( sourceSheets.contains( path ) )
+                {
+                    link( path );
+                    child->SetScreen( sourceSheets.at( path )->GetScreen() );
+                }
+                else
+                {
+                    SCH_SCREEN* existingScreen = nullptr;
+                    for( const SCH_SHEET_PATH& existing : hierarchy )
+                    {
+                        if( existing.LastScreen()->GetFileName() == path )
+                            existingScreen = existing.LastScreen();
+                    }
+                    if( !existingScreen )
+                        THROW_IO_ERROR( wxT( "missing subsheet in schematic package" ) );
+                    child->SetScreen( existingScreen );
+                }
+            }
+            sourceState[name] = 2;
+        };
+        for( const auto& [name, sheet] : sourceSheets )
+            link( name );
+        std::map<KIID, const SCH_ITEM*> existingIds;
+        for( const SCH_SHEET_PATH& path : hierarchy )
+        {
+            for( SCH_ITEM* item : path.LastScreen()->Items() )
+            {
+                existingIds.emplace( item->m_Uuid, item );
+                item->RunOnChildren( [&]( SCH_ITEM* child ){ existingIds.emplace( child->m_Uuid, child ); },
+                                     RECURSE_MODE::RECURSE );
+            }
+        }
+        std::map<KIID, const SCH_ITEM*> packageIds;
+        auto validateId = [&]( SCH_ITEM* item )
+        {
+            if( existingIds.contains( item->m_Uuid ) )
+                THROW_IO_ERROR( wxT( "package UUID collides with an existing schematic item" ) );
+            auto [found, inserted] = packageIds.emplace( item->m_Uuid, item );
+            if( !inserted && found->second != item )
+                THROW_IO_ERROR( wxT( "duplicate item UUID in schematic package" ) );
+        };
+        for( const auto& [name, sheet] : sourceSheets )
+        {
+            for( SCH_ITEM* item : sheet->GetScreen()->Items() )
+            {
+                validateId( item );
+                item->RunOnChildren( validateId, RECURSE_MODE::RECURSE );
+            }
+        }
+    }
+    catch( const IO_ERROR& error )
+    {
+        return tl::unexpected( badRequest( error.What().ToStdString() ) );
+    }
+
     PASTE_STATE state;
     state.m_projectName = project().GetProjectName();
 
@@ -306,6 +432,8 @@ HANDLER_RESULT<CreateItemsResponse> API_HANDLER_SCH::handleParseAndCreateItemsFr
     }
 
     std::set<wxString> existingSheetNames = targetScreen->GetSheetNames();
+    if( replacement )
+        existingSheetNames.erase( replacement->GetName() );
     std::set<wxString> existingSuffixes;
     std::set<wxString> composedSuffixes;
 
@@ -477,6 +605,28 @@ HANDLER_RESULT<CreateItemsResponse> API_HANDLER_SCH::handleParseAndCreateItemsFr
                     existingScreen = it->second;
             }
 
+            auto supplied = sourceSheets.find( fn.GetFullPath( wxPATH_UNIX ) );
+            if( supplied != sourceSheets.end() )
+            {
+                if( existingScreen )
+                {
+                    reject( schItem, ItemStatusCode::ISC_INVALID_DATA, "package destination is already loaded" );
+                    continue;
+                }
+                SCH_SHEET_LIST suppliedHierarchy( supplied->second.get() );
+                if( hierarchy.TestForRecursion( suppliedHierarchy, destFn.GetFullPath( wxPATH_UNIX ) ) )
+                {
+                    reject( schItem, ItemStatusCode::ISC_INVALID_DATA, "package creates recursive hierarchy" );
+                    continue;
+                }
+                existingScreen = supplied->second->GetScreen();
+                for( const auto& [name, suppliedSheet] : sourceSheets )
+                {
+                    suppliedSheet->GetScreen()->SetParent( sch );
+                    suppliedSheet->GetScreen()->SetContentModified();
+                }
+            }
+
             if( !existingScreen && fn.FileExists() )
             {
                 reject( schItem, ItemStatusCode::ISC_INVALID_DATA,
@@ -587,11 +737,12 @@ HANDLER_RESULT<CreateItemsResponse> API_HANDLER_SCH::handleParseAndCreateItemsFr
             // The clipboard path of what is below the sheet uses the old identifier
             clipPath.push_back( sheet->m_Uuid );
 
-            const_cast<KIID&>( sheet->m_Uuid ) = KIID();
+            const_cast<KIID&>( sheet->m_Uuid ) = replacement ? replacement->m_Uuid : KIID();
 
             for( SCH_SHEET_PIN* pin : sheet->GetPins() )
             {
-                const_cast<KIID&>( pin->m_Uuid ) = KIID();
+                if( !replacement )
+                    const_cast<KIID&>( pin->m_Uuid ) = KIID();
                 pin->SetConnectivityDirty();
             }
 
@@ -628,14 +779,50 @@ HANDLER_RESULT<CreateItemsResponse> API_HANDLER_SCH::handleParseAndCreateItemsFr
             item->Move( offset );
     }
 
-    for( SCH_ITEM* item : added )
+    std::optional<SCH_SHEET_PATH> returnToSheet;
+    if( replacement && m_frame && !added.empty() )
     {
+        // The old pins and child items can be held by the GUI selection. Detach them
+        // before swapping screens, and leave an active descendant before it disappears.
+        m_context->GetToolManager()->RunAction( ACTIONS::selectionClear );
+        SCH_SHEET_PATH current = frame()->GetCurrentSheet();
+        for( size_t i = 1; i < current.size(); ++i )
+        {
+            if( current.at( i ) == replacement )
+            {
+                while( current.size() > i + 1 )
+                    current.pop_back();
+                returnToSheet = current;
+                current.pop_back();
+                m_context->GetToolManager()->RunAction<SCH_SHEET_PATH*>( SCH_ACTIONS::changeSheet, &current );
+                break;
+            }
+        }
+    }
+
+    for( SCH_ITEM*& item : added )
+    {
+        if( replacement )
+        {
+            commit->Modify( replacement, targetScreen );
+            replacement->SwapItemData( item );
+            delete item;
+            item = replacement;
+            item->SetConnectivityDirty();
+            continue;
+        }
         if( m_frame && targetScreen == frame()->GetScreen() )
             frame()->AddToScreen( item, targetScreen );
         else if( !targetScreen->CheckIfOnDrawList( item ) )
             targetScreen->Append( item );
 
         commit->Added( item, targetScreen );
+    }
+
+    if( returnToSheet )
+    {
+        sch->RefreshHierarchy();
+        m_context->GetToolManager()->RunAction<SCH_SHEET_PATH*>( SCH_ACTIONS::changeSheet, &*returnToSheet );
     }
 
     if( sheetsPasted )

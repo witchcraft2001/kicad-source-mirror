@@ -19,6 +19,7 @@
  */
 
 #include <api/api_handler_sch.h>
+#include <tool/actions.h>
 #include <set>
 #include <api/restore_project.h>
 #include <nlohmann/json.hpp>
@@ -151,6 +152,7 @@ API_HANDLER_SCH::API_HANDLER_SCH( std::shared_ptr<SCH_CONTEXT> aContext,
     using namespace kiapi::schematic::types;
     using namespace kiapi::schematic::commands;
 
+    registerHandler<RunAction, RunActionResponse>( &API_HANDLER_SCH::handleHistoryAction );
     registerHandler<GetOpenDocuments, GetOpenDocumentsResponse>(
             &API_HANDLER_SCH::handleGetOpenDocuments );
     registerHandler<SaveDocument, google::protobuf::Empty>(
@@ -193,6 +195,9 @@ API_HANDLER_SCH::API_HANDLER_SCH( std::shared_ptr<SCH_CONTEXT> aContext,
             &API_HANDLER_SCH::handleRunSchematicJobExportNetlist );
     registerHandler<RunSchematicJobExportBOM, types::RunJobResponse>(
             &API_HANDLER_SCH::handleRunSchematicJobExportBOM );
+    registerHandler<GetSchematicBuses, SchematicBusesResponse>( &API_HANDLER_SCH::handleGetSchematicBuses );
+    registerHandler<GetSchematicBusAliases, SchematicBusAliasesResponse>( &API_HANDLER_SCH::handleGetSchematicBusAliases );
+    registerHandler<SetSchematicBusAliases, Empty>( &API_HANDLER_SCH::handleSetSchematicBusAliases );
     registerHandler<GetSchematicHierarchy, SchematicHierarchyResponse>( &API_HANDLER_SCH::handleGetSchematicHierarchy );
     registerHandler<GetPageSettings, types::PageSettings>( &API_HANDLER_SCH::handleGetPageSettings );
     registerHandler<SetPageSettings, types::PageSettings>( &API_HANDLER_SCH::handleSetPageSettings );
@@ -1613,6 +1618,12 @@ HANDLER_RESULT<ItemRequestStatus> API_HANDLER_SCH::handleCreateUpdateItemsIntern
                 continue;
             }
 
+            // A metadata-only update retains the backing screen. swapData also swaps screens
+            // so that Undo can restore an explicit hierarchy source replacement.
+            if( *type == SCH_SHEET_T )
+                static_cast<SCH_SHEET*>( item.get() )->SetScreen(
+                        static_cast<SCH_SHEET*>( existingItem )->GetScreen() );
+
             commit->Modify( existingItem, targetScreen );
             existingItem->SwapItemData( static_cast<SCH_ITEM*>( item.get() ) );
 
@@ -1698,6 +1709,25 @@ void API_HANDLER_SCH::deleteItemsInternal( std::map<KIID, ItemDeletionStatus>& a
             continue;
         }
 
+        if( m_frame && item->Type() == SCH_SHEET_T )
+        {
+            SCH_SHEET_PATH current = frame()->GetCurrentSheet();
+            size_t index = current.size();
+            for( size_t i = 1; i < current.size(); ++i )
+            {
+                if( current.at( i ) == item )
+                {
+                    index = i;
+                    break;
+                }
+            }
+            if( index < current.size() )
+            {
+                while( current.size() > index )
+                    current.pop_back();
+                m_context->GetToolManager()->RunAction<SCH_SHEET_PATH*>( SCH_ACTIONS::changeSheet, &current );
+            }
+        }
         commit->Remove( item, path.LastScreen() );
         status = ItemDeletionStatus::IDS_OK;
     }
@@ -3864,5 +3894,179 @@ HANDLER_RESULT<commands::DocumentStateResponse> API_HANDLER_SCH::handleDocumentS
             { LIBRARY_TABLE_TYPE::SYMBOL, LIBRARY_TABLE_TYPE::FOOTPRINT } );
     m_restoreProject.reset();
     m_restoreToken.clear();
+    return response;
+}
+
+HANDLER_RESULT<kiapi::schematic::commands::SchematicBusesResponse>
+API_HANDLER_SCH::handleGetSchematicBuses(
+        const HANDLER_CONTEXT<kiapi::schematic::commands::GetSchematicBuses>& aCtx )
+{
+    if( auto valid = validateDocument( aCtx.Request.document() ); !valid )
+        return tl::unexpected( valid.error() );
+    if( auto busy = checkForBusy() )
+        return tl::unexpected( *busy );
+    schematic()->RebuildConnectivity();
+    kiapi::schematic::commands::SchematicBusesResponse response;
+    auto members = []( const SCH_CONNECTION* connection, auto add, bool local = false )
+    {
+        std::function<void( const SCH_CONNECTION* )> collect = [&]( const SCH_CONNECTION* c )
+        {
+            if( c->IsBus() )
+            {
+                for( const auto& child : c->Members() )
+                    collect( child.get() );
+            }
+            else
+                add( c->Name( local ).ToUTF8() );
+        };
+        collect( connection );
+    };
+    if( ADVANCED_CFG::GetCfg().m_ConnectivityEngine )
+    {
+        for( const auto& group : schematic()->Connectivity().GetNetMap() )
+        {
+            for( const auto& view : group.instances )
+            {
+                if( !view.IsBus() || ( aCtx.Request.document().has_sheet_path()
+                    && view.Instance() != UnpackSheetPath( aCtx.Request.document().sheet_path() ) ) )
+                    continue;
+                for( SCH_ITEM* item : view.Items() )
+                {
+                    auto* bus = response.add_buses();
+                    bus->mutable_item()->set_value( item->m_Uuid.AsStdString() );
+                    PackSheetPath( *bus->mutable_path(), view.Instance() );
+                    bus->set_name( group.name.ToUTF8() );
+                    auto itemView = schematic()->Connectivity().Connection( item->m_Uuid, view.Instance() );
+                    auto data = itemView ? itemView->Members() : view.Members();
+                    for( const auto& leaf : data.leaves )
+                        bus->add_members( leaf.Name().ToUTF8() );
+                    if( data.schema )
+                    {
+                        for( const auto& leaf : data.schema->leaves )
+                            bus->add_declaration_members( leaf.name.ToUTF8() );
+                    }
+                }
+            }
+        }
+    }
+    else
+    for( const SCH_SHEET_PATH& path : schematic()->Hierarchy() )
+    {
+        if( aCtx.Request.document().has_sheet_path()
+            && path.Path() != UnpackSheetPath( aCtx.Request.document().sheet_path() ) )
+            continue;
+        for( SCH_ITEM* item : path.LastScreen()->Items() )
+        {
+            if( !item->IsConnectable() )
+                continue;
+            SCH_CONNECTION* connection = item->Connection( &path );
+            if( !connection || !connection->IsBus() )
+                continue;
+            auto* bus = response.add_buses();
+            bus->mutable_item()->set_value( item->m_Uuid.AsStdString() );
+            PackSheetPath( *bus->mutable_path(), path );
+            bus->set_name( connection->Name().ToUTF8() );
+            members( connection, [&]( const auto& name ){ bus->add_members( name ); } );
+            members( connection, [&]( const auto& name ){ bus->add_declaration_members( name ); }, true );
+        }
+    }
+    if( !aCtx.Request.expression().empty() )
+    {
+        SCH_CONNECTIVITY::BUS_ALIASES aliases;
+        for( const auto& alias : schematic()->GetAllBusAliases() )
+            aliases[alias->GetName()] = alias->Members();
+        if( auto schema = SCH_CONNECTIVITY::BUS_SCHEMA::Parse(
+                    wxString::FromUTF8( aCtx.Request.expression() ), aliases ) )
+        {
+            for( const auto& leaf : schema->leaves )
+                response.add_expression_members( leaf.name.ToUTF8() );
+        }
+    }
+    return response;
+}
+
+HANDLER_RESULT<kiapi::schematic::commands::SchematicBusAliasesResponse>
+API_HANDLER_SCH::handleGetSchematicBusAliases(
+        const HANDLER_CONTEXT<kiapi::schematic::commands::GetSchematicBusAliases>& aCtx )
+{
+    if( auto valid = validateDocument( aCtx.Request.document() ); !valid )
+        return tl::unexpected( valid.error() );
+    kiapi::schematic::commands::SchematicBusAliasesResponse response;
+    for( const auto& alias : schematic()->GetAllBusAliases() )
+    {
+        auto* entry = response.add_aliases();
+        entry->set_name( alias->GetName().ToUTF8() );
+        for( const wxString& member : alias->Members() )
+            entry->add_members( member.ToUTF8() );
+    }
+    return response;
+}
+
+HANDLER_RESULT<Empty> API_HANDLER_SCH::handleSetSchematicBusAliases(
+        const HANDLER_CONTEXT<kiapi::schematic::commands::SetSchematicBusAliases>& aCtx )
+{
+    if( auto valid = validateDocument( aCtx.Request.document() ); !valid )
+        return tl::unexpected( valid.error() );
+    if( auto busy = checkForBusy() )
+        return tl::unexpected( *busy );
+    std::vector<std::shared_ptr<BUS_ALIAS>> aliases;
+    std::set<wxString> names;
+    for( const auto& entry : aCtx.Request.aliases() )
+    {
+        wxString name = wxString::FromUTF8( entry.name() );
+        if( name.IsEmpty() || !names.insert( name ).second || entry.members().empty() )
+        {
+            ApiResponseStatus error;
+            error.set_status( ApiStatusCode::AS_BAD_REQUEST );
+            error.set_error_message( "bus aliases require distinct nonempty names and nonempty members" );
+            return tl::unexpected( error );
+        }
+        auto alias = std::make_shared<BUS_ALIAS>();
+        alias->SetName( name );
+        for( const auto& member : entry.members() )
+            alias->AddMember( wxString::FromUTF8( member ) );
+        aliases.push_back( alias );
+    }
+    SCH_SHEET& root = schematic()->Root();
+    root.CaptureBusAliasesForUndo();
+    getCurrentCommit( aCtx.ClientName )->Modify( &root, schematic()->RootScreen() );
+    root.ClearBusAliasesUndo();
+    schematic()->SetBusAliases( aliases );
+    if( !m_activeClients.contains( aCtx.ClientName ) )
+        pushCurrentCommit( aCtx.ClientName, _( "Modified bus aliases via API" ) );
+    schematic()->RebuildConnectivity();
+    return Empty();
+}
+
+HANDLER_RESULT<commands::RunActionResponse> API_HANDLER_SCH::handleHistoryAction(
+        const HANDLER_CONTEXT<commands::RunAction>& aCtx )
+{
+    if( !m_frame )
+    {
+        ApiResponseStatus error;
+        error.set_status( ApiStatusCode::AS_UNIMPLEMENTED );
+        error.set_error_message( "Undo/Redo requires a schematic editor window" );
+        return tl::unexpected( error );
+    }
+    if( auto busy = checkForBusy() )
+        return tl::unexpected( *busy );
+    if( !m_activeClients.empty() )
+    {
+        ApiResponseStatus error;
+        error.set_status( ApiStatusCode::AS_BUSY );
+        error.set_error_message( "close edit groups before Undo/Redo" );
+        return tl::unexpected( error );
+    }
+    commands::RunActionResponse response;
+    if( aCtx.Request.action() == "common.Interactive.undo" )
+        m_context->GetToolManager()->RunAction( ACTIONS::undo );
+    else if( aCtx.Request.action() == "common.Interactive.redo" )
+        m_context->GetToolManager()->RunAction( ACTIONS::redo );
+    else
+    {
+        response.set_status( commands::RAS_INVALID );
+        return response;
+    }
+    response.set_status( commands::RAS_OK );
     return response;
 }

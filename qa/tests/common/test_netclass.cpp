@@ -20,6 +20,9 @@
 #include <boost/test/unit_test.hpp>
 
 #include <netclass.h>
+#include <stroke_params.h>
+#include <api/common/types/project_settings.pb.h>
+#include <google/protobuf/any.pb.h>
 
 
 BOOST_AUTO_TEST_SUITE( NetclassTests )
@@ -65,5 +68,28 @@ BOOST_AUTO_TEST_CASE( NameEqualsMatchesGetName )
     check( composite, wxS( "Power" ), false );
 }
 
+
+BOOST_AUTO_TEST_CASE( SchematicLineStyleRoundTripsThroughApi )
+{
+    for( int style = static_cast<int>( LINE_STYLE::DEFAULT );
+         style <= static_cast<int>( LINE_STYLE::DASHDOTDOT ); ++style )
+    {
+        NETCLASS original( wxS( "Signal" ) );
+        original.SetLineStyle( style );
+        original.SetuViaDiameter( 300000 );
+        original.SetuViaDrill( 100000 );
+        google::protobuf::Any packed;
+        original.Serialize( packed );
+        kiapi::common::project::NetClass proto;
+        BOOST_REQUIRE( packed.UnpackTo( &proto ) );
+        BOOST_REQUIRE( proto.schematic().has_line_style() );
+        NETCLASS restored( wxS( "Restored" ) );
+        BOOST_REQUIRE( restored.Deserialize( packed ) );
+        BOOST_REQUIRE( restored.HasLineStyle() );
+        BOOST_CHECK_EQUAL( restored.GetLineStyle(), style );
+        BOOST_CHECK_EQUAL( restored.GetuViaDiameter(), 300000 );
+        BOOST_CHECK_EQUAL( restored.GetuViaDrill(), 100000 );
+    }
+}
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -51,7 +51,7 @@ bool SaveSheetToFile( SCH_SHEET* aSheet, SCHEMATIC& aSchematic, const wxString& 
     wxFileName schematicFileName( aPath );
     schematicFileName.MakeAbsolute();
 
-    if( !schematicFileName.DirExists() && !wxMkdir( schematicFileName.GetPath() ) )
+    if( !schematicFileName.DirExists() && !wxFileName::Mkdir( schematicFileName.GetPath(), wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL ) )
         return false;
 
     if( schematicFileName.FileExists() && !schematicFileName.IsFileWritable() )

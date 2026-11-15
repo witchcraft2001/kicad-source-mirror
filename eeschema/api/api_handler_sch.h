@@ -56,6 +56,8 @@ public:
     API_HANDLER_SCH( std::shared_ptr<SCH_CONTEXT> aContext, SCH_EDIT_FRAME* aFrame = nullptr );
 
 protected:
+    HANDLER_RESULT<commands::RunActionResponse> handleHistoryAction(
+            const HANDLER_CONTEXT<commands::RunAction>& aCtx );
     HANDLER_RESULT<commands::DocumentStateResponse> handleDocumentState(
             const HANDLER_CONTEXT<commands::DocumentStateRequest>& aCtx );
     std::shared_ptr<PROJECT> m_restoreProject;
@@ -65,6 +67,13 @@ protected:
     std::string m_restoreOwner;
     std::string m_restoreOriginal;
     std::string m_restoreOriginalProject;
+
+    HANDLER_RESULT<kiapi::schematic::commands::SchematicBusesResponse> handleGetSchematicBuses(
+            const HANDLER_CONTEXT<kiapi::schematic::commands::GetSchematicBuses>& aCtx );
+    HANDLER_RESULT<kiapi::schematic::commands::SchematicBusAliasesResponse> handleGetSchematicBusAliases(
+            const HANDLER_CONTEXT<kiapi::schematic::commands::GetSchematicBusAliases>& aCtx );
+    HANDLER_RESULT<Empty> handleSetSchematicBusAliases(
+            const HANDLER_CONTEXT<kiapi::schematic::commands::SetSchematicBusAliases>& aCtx );
 
     std::optional<ApiResponseStatus> checkForHeadless( const std::string& aCommandName ) const;
 
