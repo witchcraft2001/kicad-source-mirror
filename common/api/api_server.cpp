@@ -218,6 +218,20 @@ void KICAD_API_SERVER::DeregisterHandler( API_HANDLER* aHandler )
 }
 
 
+std::set<std::string> KICAD_API_SERVER::SupportedCommands() const
+{
+    std::set<std::string> commands;
+
+    for( const API_HANDLER* handler : m_handlers )
+    {
+        const auto names = handler->SupportedCommands();
+        commands.insert( names.begin(), names.end() );
+    }
+
+    return commands;
+}
+
+
 void KICAD_API_SERVER::NotifyNetSettingsChanged()
 {
     for( API_HANDLER* handler : m_handlers )

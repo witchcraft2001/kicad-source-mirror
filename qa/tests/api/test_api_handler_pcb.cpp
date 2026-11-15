@@ -354,6 +354,73 @@ int64_t netLength( API_HANDLER_PCB& aHandler, BOARD* aBoard, const std::string& 
 BOOST_FIXTURE_TEST_SUITE( ApiHandlerPcb, API_HANDLER_PCB_FIXTURE )
 
 
+BOOST_AUTO_TEST_CASE( DocumentRestoreRejectsInvalidInputWithoutChangingBoard )
+{
+    using namespace kiapi::common;
+    using Request = commands::DocumentStateRequest;
+    BOARD* board = loadBoard( wxS( "issue5830" ) );
+    API_HANDLER_PCB handler( m_context );
+    Request command;
+    *command.mutable_document() = makeBoardDocument( *board );
+    command.set_action( Request::READ );
+    ApiRequest request;
+    request.mutable_header()->set_client_name( "kicad.qa.restore" );
+    BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+    auto state = handler.Handle( request );
+    BOOST_REQUIRE( state.has_value() );
+    commands::DocumentStateResponse response;
+    BOOST_REQUIRE( state->message().UnpackTo( &response ) );
+    BOOST_CHECK( !response.project_json().empty() );
+    command.set_action( Request::PREPARE );
+    command.set_source( "/nonexistent/document.kicad_pcb" );
+    command.set_project_json( response.project_json() );
+    BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+    auto prepared = handler.Handle( request );
+    BOOST_CHECK( !prepared.has_value() );
+    BOOST_CHECK( m_context->GetBoard() == board );
+    command.set_action( Request::APPLY );
+    command.set_token( "unknown" );
+    BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+    BOOST_CHECK( !handler.Handle( request ).has_value() );
+    BOOST_CHECK( m_context->GetBoard() == board );
+}
+
+
+BOOST_AUTO_TEST_CASE( DocumentRestoreRefusesConcurrentEdit )
+{
+    using namespace kiapi::common;
+    using Request = commands::DocumentStateRequest;
+    BOARD* board = loadBoard( wxS( "issue5830" ) );
+    API_HANDLER_PCB handler( m_context );
+    Request command;
+    *command.mutable_document() = makeBoardDocument( *board );
+    ApiRequest request;
+    request.mutable_header()->set_client_name( "kicad.qa.restore" );
+    BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+    auto state = handler.Handle( request );
+    BOOST_REQUIRE( state.has_value() );
+    commands::DocumentStateResponse captured;
+    BOOST_REQUIRE( state->message().UnpackTo( &captured ) );
+    command.set_action( Request::PREPARE );
+    command.set_source( KI_TEST::GetPcbnewTestDataDir() + "issue5830.kicad_pcb" );
+    command.set_project_json( captured.project_json() );
+    BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+    auto staged = handler.Handle( request );
+    BOOST_REQUIRE_MESSAGE( staged.has_value(),
+                           ( staged.has_value() ? std::string() : staged.error().error_message() ) );
+    commands::DocumentStateResponse prepared;
+    BOOST_REQUIRE( staged->message().UnpackTo( &prepared ) );
+    BOOST_REQUIRE( !board->Zones().empty() );
+    board->Zones()[0]->SetZoneName( "Changed after prepare" );
+    command.set_action( Request::APPLY );
+    command.set_token( prepared.token() );
+    BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+    BOOST_CHECK( !handler.Handle( request ).has_value() );
+    BOOST_CHECK( m_context->GetBoard() == board );
+    BOOST_CHECK_EQUAL( board->Zones()[0]->GetZoneName(), "Changed after prepare" );
+}
+
+
 BOOST_AUTO_TEST_CASE( OdbJobRequestMapsVariants )
 {
     using PACKAGING = JOB_EXPORT_PCB_ODB::VARIANT_PACKAGING;

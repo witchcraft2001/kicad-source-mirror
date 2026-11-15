@@ -597,6 +597,31 @@ bool JSON_SETTINGS::SaveToFile( const wxString& aDirectory, bool aForce )
 }
 
 
+std::string JSON_SETTINGS::CaptureState()
+{
+    // Nested stores may themselves own nested stores (for example simulator settings).
+    for( NESTED_SETTINGS* settings : m_nested_settings )
+        settings->CaptureState();
+
+    flushToStore();
+    return static_cast<const nlohmann::json&>( *m_internals ).dump();
+}
+
+
+bool JSON_SETTINGS::RestoreState( const std::string& aContents )
+{
+    if( !LoadFromBuffer( aContents ) )
+        return false;
+
+    for( NESTED_SETTINGS* settings : m_nested_settings )
+        settings->LoadFromFile();
+
+    m_modified = true;
+    m_fileSynced = false;
+    return true;
+}
+
+
 bool JSON_SETTINGS::flushToStore()
 {
     bool modified = false;

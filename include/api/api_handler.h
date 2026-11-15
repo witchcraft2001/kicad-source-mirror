@@ -22,6 +22,7 @@
 #define KICAD_API_HANDLER_H
 
 #include <functional>
+#include <set>
 #include <optional>
 
 #include <fmt/format.h>
@@ -89,6 +90,16 @@ public:
      * assignments) have been changed via the API.
      */
     virtual void onNetSettingsChanged() {}
+
+    std::set<std::string> SupportedCommands() const
+    {
+        std::set<std::string> commands;
+
+        for( const auto& [name, entry] : m_handlers )
+            commands.insert( name );
+
+        return commands;
+    }
 
     void requestNetSettingsNotification() { m_notifyNetSettings = true; }
 

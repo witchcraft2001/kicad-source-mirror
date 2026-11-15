@@ -102,6 +102,9 @@ protected:
     std::vector<KICAD_T> parseRequestedItemTypes(
             const google::protobuf::RepeatedField<int>& aTypes );
 
+    HANDLER_RESULT<commands::SavedDocumentResponse> handleSaveDocumentToString(
+            const HANDLER_CONTEXT<commands::SaveDocumentToString>& aCtx );
+
 private:
     HANDLER_RESULT<commands::RunActionResponse> handleRunAction(
             const HANDLER_CONTEXT<commands::RunAction>& aCtx );
@@ -153,8 +156,6 @@ private:
     HANDLER_RESULT<FlipItemsResponse> handleFlipItems(
             const HANDLER_CONTEXT<FlipItems>& aCtx );
 
-    HANDLER_RESULT<commands::SavedDocumentResponse> handleSaveDocumentToString(
-            const HANDLER_CONTEXT<commands::SaveDocumentToString>& aCtx );
 
     HANDLER_RESULT<commands::SavedSelectionResponse> handleSaveSelectionToString(
             const HANDLER_CONTEXT<commands::SaveSelectionToString>& aCtx );

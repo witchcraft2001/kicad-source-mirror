@@ -22,6 +22,8 @@
 #include <api/sch_api_save.h>
 
 #include <sch_edit_frame.h>
+#include <schematic.h>
+#include <tool/tool_manager.h>
 
 
 class SCH_EDIT_FRAME_CONTEXT : public SCH_CONTEXT
@@ -91,6 +93,15 @@ public:
             return false;
 
         return m_frame->ReloadFromDisk();
+    }
+
+    void ReplaceDocument( SCHEMATIC* aDocument ) override
+    {
+        m_frame->GetToolManager()->ResetTools( TOOL_BASE::MODEL_RELOAD );
+        m_frame->SetSchematic( aDocument );
+        m_frame->SetCurrentSheet( aDocument->Hierarchy().at( 0 ) );
+        m_frame->GetToolManager()->ResetTools( TOOL_BASE::MODEL_RELOAD );
+        m_frame->DisplayCurrentSheet();
     }
 
 private:

@@ -337,6 +337,32 @@ BOOST_FIXTURE_TEST_CASE( EmbeddedFiles, PROTO_TEST_FIXTURE )
 }
 
 
+BOOST_FIXTURE_TEST_CASE( ZoneLockRoundTrip, PROTO_TEST_FIXTURE )
+{
+    m_board = std::make_unique<BOARD>();
+
+    for( bool ruleArea : { false, true } )
+    {
+        for( bool locked : { false, true } )
+        {
+            ZONE zone( m_board.get() );
+            zone.SetLayer( F_Cu );
+            zone.SetIsRuleArea( ruleArea );
+            zone.SetLocked( locked );
+            zone.AppendCorner( VECTOR2I( 0, 0 ), -1 );
+            zone.AppendCorner( VECTOR2I( 1000000, 0 ), -1 );
+            zone.AppendCorner( VECTOR2I( 0, 1000000 ), -1 );
+            google::protobuf::Any packed;
+            zone.Serialize( packed );
+            ZONE restored( m_board.get() );
+            BOOST_REQUIRE( restored.Deserialize( packed ) );
+            BOOST_CHECK_EQUAL( restored.IsLocked(), locked );
+            BOOST_CHECK_EQUAL( restored.GetIsRuleArea(), ruleArea );
+        }
+    }
+}
+
+
 /**
  * Round-trip a copper-thieving zone through the protobuf API.  The shared
  * testProtoFromKiCadObject helper relies on ZONE::operator==, which by

@@ -19,6 +19,15 @@
  */
 
 #include <api/api_handler_sch.h>
+#include <set>
+#include <api/restore_project.h>
+#include <nlohmann/json.hpp>
+#include <libraries/library_manager.h>
+#include <pgm_base.h>
+#include <wx/filename.h>
+#include <eeschema_helpers.h>
+#include <sch_screen.h>
+
 #include <api/api_enums.h>
 #include <api/api_sch_utils.h>
 #include <api/api_utils.h>
@@ -151,6 +160,8 @@ API_HANDLER_SCH::API_HANDLER_SCH( std::shared_ptr<SCH_CONTEXT> aContext,
     registerHandler<RevertDocument, google::protobuf::Empty>( &API_HANDLER_SCH::handleRevertDocument );
     registerHandler<SaveDocumentAs, google::protobuf::Empty>( &API_HANDLER_SCH::handleSaveDocumentAs );
 
+    registerHandler<commands::DocumentStateRequest, commands::DocumentStateResponse>(
+            &API_HANDLER_SCH::handleDocumentState );
     registerHandler<commands::SaveDocumentToString, commands::SavedDocumentResponse>(
             &API_HANDLER_SCH::handleSaveDocumentToString );
     registerHandler<commands::SaveSelectionToString, commands::SavedSelectionResponse>(
@@ -1106,6 +1117,22 @@ HANDLER_RESULT<Empty> API_HANDLER_SCH::handleFocusOnItems( const HANDLER_CONTEXT
 
     if( aCtx.Request.document().has_sheet_path() )
         sheetPath = UnpackSheetPath( aCtx.Request.document().sheet_path() );
+
+    // Restoring an editor view must also work when the captured sheet had no selection.
+    if( ids.empty() && sheetPath )
+    {
+        auto sheet = schematic()->Hierarchy().GetSheetPathByKIIDPath( *sheetPath );
+        if( !sheet )
+        {
+            ApiResponseStatus error;
+            error.set_status( ApiStatusCode::AS_BAD_REQUEST );
+            error.set_error_message( "the requested schematic sheet does not exist" );
+            return tl::unexpected( error );
+        }
+        if( m_context->GetCurrentSheet().value_or( SCH_SHEET_PATH() ) != *sheet )
+            m_context->GetToolManager()->RunAction<SCH_SHEET_PATH*>( SCH_ACTIONS::changeSheet, &*sheet );
+        return Empty();
+    }
 
     tl::expected<SCH_FOCUS_TARGET, ApiResponseStatus> target = ResolveFocusItems( *schematic(), ids, sheetPath );
 
@@ -3693,5 +3720,149 @@ HANDLER_RESULT<PlaceFromLibraryResponse> API_HANDLER_SCH::handlePlaceSymbolFromL
     if( PackSymbol( &packed, placed, targetPath, schematic() ) )
         (void) response.mutable_item()->PackFrom( packed );
 
+    return response;
+}
+
+
+HANDLER_RESULT<commands::DocumentStateResponse> API_HANDLER_SCH::handleDocumentState(
+        const HANDLER_CONTEXT<commands::DocumentStateRequest>& aCtx )
+{
+    using Request = commands::DocumentStateRequest;
+    const auto& request = aCtx.Request;
+    if( auto valid = validateDocument( request.document() ); !valid )
+        return tl::unexpected( valid.error() );
+    if( auto busy = checkForBusy() )
+        return tl::unexpected( *busy );
+    auto fail = []( const std::string& message ) -> HANDLER_RESULT<commands::DocumentStateResponse>
+    {
+        ApiResponseStatus status;
+        status.set_status( ApiStatusCode::AS_BAD_REQUEST );
+        status.set_error_message( message );
+        return tl::unexpected( status );
+    };
+    auto fingerprint = [&]() -> std::optional<std::string>
+    {
+        HANDLER_CONTEXT<commands::SaveDocumentToString> capture;
+        capture.ClientName = aCtx.ClientName;
+        *capture.Request.mutable_document() = request.document();
+        std::string result;
+        for( const SCH_SHEET_PATH& sheet : schematic()->Hierarchy() )
+        {
+            PackSheetPath( *capture.Request.mutable_document()->mutable_sheet_path(), sheet );
+            auto saved = handleSaveDocumentToString( capture );
+            if( !saved )
+                return std::nullopt;
+            result += saved->contents();
+        }
+        return result;
+    };
+    if( !m_commits.empty() )
+        return fail( "close all edit groups before accessing document state" );
+    commands::DocumentStateResponse response;
+    if( request.action() == Request::READ )
+    {
+        response.set_project_json( context()->Prj().GetProjectFile().CaptureState() );
+        std::set<SCH_SCREEN*> seen;
+        for( SCH_SHEET* root : schematic()->GetTopLevelSheets() )
+        {
+            SCH_SCREENS screens( *root );
+            for( SCH_SCREEN* screen = screens.GetFirst(); screen; screen = screens.GetNext() )
+            {
+                if( !seen.insert( screen ).second )
+                    continue;
+                wxFileName name( screen->GetFileName() );
+                name.MakeRelativeTo( context()->Prj().GetProjectPath() );
+                ( *response.mutable_modified() )[name.GetFullPath().ToStdString()] = screen->IsContentModified();
+            }
+        }
+        return response;
+    }
+    // A fresh prepare may replace abandoned staging after a client restart. Old tokens
+    // are invalidated; no live model is changed until a matching apply.
+    if( !m_restoreToken.empty() && m_restoreOwner != aCtx.ClientName
+        && request.action() != Request::PREPARE )
+        return fail( "another client owns the prepared restore" );
+    if( request.action() == Request::ABORT )
+    {
+        m_restoreDocument.reset();
+        m_restoreProject.reset();
+        m_restoreToken.clear();
+        return response;
+    }
+    if( request.action() == Request::PREPARE )
+    {
+        auto original = fingerprint();
+        if( !original )
+            return fail( "could not capture document revision" );
+        m_restoreOriginal = *original;
+        m_restoreOriginalProject = context()->Prj().GetProjectFile().CaptureState();
+        m_restoreDocument.reset();
+        wxFileName source( wxString::FromUTF8( request.source() ) );
+        if( !source.IsAbsolute() || !source.IsFileReadable() )
+            return fail( "restore source must be a readable absolute filename" );
+        wxFileName pro( source );
+        pro.SetExt( "kicad_pro" );
+        m_restoreProject = std::make_shared<API_RESTORE_PROJECT>( pro.GetFullPath() );
+        if( !m_restoreProject->GetProjectFile().RestoreState( request.project_json() ) )
+            return fail( "invalid project state" );
+        try
+        {
+            m_restoreDocument.reset( EESCHEMA_HELPERS::LoadSchematic(
+                source.GetFullPath(), false, false, m_restoreProject.get() ) );
+        }
+        catch( ... )
+        {
+            return fail( "restore source could not be parsed" );
+        }
+        if( !m_restoreDocument )
+            return fail( "restore source did not produce a document" );
+        m_restoreRequest = request;
+        m_restoreOwner = aCtx.ClientName;
+        m_restoreToken = KIID().AsStdString();
+        response.set_token( m_restoreToken );
+        return response;
+    }
+    if( request.action() != Request::APPLY || request.token() != m_restoreToken
+        || m_restoreToken.empty() || !m_restoreDocument )
+        return fail( "no matching prepared restore" );
+    const auto currentProject = nlohmann::json::parse( context()->Prj().GetProjectFile().CaptureState() );
+    if( currentProject != nlohmann::json::parse( m_restoreOriginalProject )
+        && currentProject != nlohmann::json::parse( m_restoreRequest.project_json() ) )
+        return fail( "document changed after restore was prepared (project settings)" );
+    auto current = fingerprint();
+    if( !current || *current != m_restoreOriginal )
+        return fail( "document changed after restore was prepared" );
+    wxFileName source( wxString::FromUTF8( m_restoreRequest.source() ) );
+    std::set<SCH_SCREEN*> seen;
+    for( SCH_SHEET* root : m_restoreDocument->GetTopLevelSheets() )
+    {
+        SCH_SCREENS screens( *root );
+        for( SCH_SCREEN* screen = screens.GetFirst(); screen; screen = screens.GetNext() )
+        {
+            if( !seen.insert( screen ).second )
+                continue;
+            wxFileName name( screen->GetFileName() );
+            name.MakeRelativeTo( source.GetPath() );
+            std::string relative = name.GetFullPath().ToStdString();
+            name.MakeAbsolute( context()->Prj().GetProjectPath() );
+            screen->SetFileName( name.GetFullPath() );
+            auto dirty = m_restoreRequest.modified().find( relative );
+            screen->SetContentModified( dirty != m_restoreRequest.modified().end() && dirty->second );
+        }
+        wxFileName rootFile( root->GetFileName() );
+        if( rootFile.IsAbsolute() )
+            rootFile.MakeRelativeTo( source.GetPath() );
+        root->SetFileName( rootFile.GetFullPath() );
+    }
+    m_restoreDocument->Root().SetFileName( wxFileName( schematic()->GetFileName() ).GetFullName() );
+    m_restoreDocument->SetProject( nullptr );
+    context()->ReplaceDocument( m_restoreDocument.release() );
+    context()->Prj().GetProjectFile().RestoreState( m_restoreRequest.project_json() );
+
+    requestNetSettingsNotification();
+    Pgm().GetLibraryManager().ReloadTables( LIBRARY_TABLE_SCOPE::PROJECT,
+            { LIBRARY_TABLE_TYPE::SYMBOL, LIBRARY_TABLE_TYPE::FOOTPRINT } );
+    m_restoreProject.reset();
+    m_restoreToken.clear();
     return response;
 }

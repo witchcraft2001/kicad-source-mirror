@@ -25,6 +25,7 @@
 #include <tuple>
 
 #include <api/api_handler_common.h>
+#include <api/api_server.h>
 #include <wx/filename.h>
 #include <api/api_task_scheduler.h>
 #include <build_version.h>
@@ -58,6 +59,8 @@ using google::protobuf::Empty;
 API_HANDLER_COMMON::API_HANDLER_COMMON() :
         API_HANDLER()
 {
+    registerHandler<GetCapabilities, CapabilitiesResponse>(
+            &API_HANDLER_COMMON::handleGetCapabilities, true );
     registerHandler<commands::GetVersion, GetVersionResponse>( &API_HANDLER_COMMON::handleGetVersion );
     registerHandler<GetKiCadBinaryPath, PathResponse>(
             &API_HANDLER_COMMON::handleGetKiCadBinaryPath );
@@ -93,6 +96,22 @@ API_HANDLER_COMMON::API_HANDLER_COMMON() :
             &API_HANDLER_COMMON::handleGetTaskStatus, true );
     registerHandler<CalculateTransmissionLine, TransmissionLineResponse>(
             &API_HANDLER_COMMON::handleCalculateTransmissionLine );
+}
+
+
+HANDLER_RESULT<CapabilitiesResponse> API_HANDLER_COMMON::handleGetCapabilities(
+        const HANDLER_CONTEXT<GetCapabilities>& )
+{
+    CapabilitiesResponse response;
+    const auto commands = m_apiServer ? m_apiServer->SupportedCommands() : SupportedCommands();
+
+    for( const std::string& name : commands )
+        response.add_commands( name );
+
+    ( *response.mutable_features() )["zone_locked"] = 1;
+    ( *response.mutable_features() )["document_restore"] =
+            commands.contains( "kiapi.common.commands.DocumentStateRequest" ) ? 1 : 0;
+    return response;
 }
 
 

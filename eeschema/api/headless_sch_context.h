@@ -63,6 +63,8 @@ public:
 
     bool RevertToSaved() override;
 
+    void ReplaceDocument( SCHEMATIC* aDocument ) override;
+
 private:
     // Pointer-to-pointer because we don't own the schematic and the underlying pointer gets
     // replaced if the client calls RevertToSaved.  This will always point to the IFACE's pointer.

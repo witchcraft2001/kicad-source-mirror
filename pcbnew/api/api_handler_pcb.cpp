@@ -27,6 +27,13 @@
 #include <common.h>
 #include <fmt.h>
 #include <api/api_handler_pcb.h>
+#include <api/restore_project.h>
+#include <nlohmann/json.hpp>
+#include <libraries/library_manager.h>
+#include <pgm_base.h>
+#include <wx/filename.h>
+#include <board_loader.h>
+
 #include <api/api_pns_iface.h>
 #include <api/api_pcb_utils.h>
 #include <api/api_enums.h>
@@ -138,6 +145,8 @@ API_HANDLER_PCB::API_HANDLER_PCB( PCB_EDIT_FRAME* aFrame ) :
 API_HANDLER_PCB::API_HANDLER_PCB( std::shared_ptr<PCB_CONTEXT> aContext, PCB_EDIT_FRAME* aFrame ) :
         API_HANDLER_BOARD( std::move( aContext ), aFrame )
 {
+    registerHandler<commands::DocumentStateRequest, commands::DocumentStateResponse>(
+            &API_HANDLER_PCB::handleDocumentState );
     registerHandler<GetOpenDocuments, GetOpenDocumentsResponse>(
             &API_HANDLER_PCB::handleGetOpenDocuments );
     registerHandler<SaveDocument, Empty>( &API_HANDLER_PCB::handleSaveDocument );
@@ -4547,5 +4556,118 @@ API_HANDLER_PCB::handleExchangeFootprints( const HANDLER_CONTEXT<ExchangeFootpri
         pushCurrentCommit( aCtx.ClientName, changeMode ? _( "Changed footprints via API" )
                                                        : _( "Updated footprints via API" ) );
 
+    return response;
+}
+
+
+HANDLER_RESULT<commands::DocumentStateResponse> API_HANDLER_PCB::handleDocumentState(
+        const HANDLER_CONTEXT<commands::DocumentStateRequest>& aCtx )
+{
+    using Request = commands::DocumentStateRequest;
+    const auto& request = aCtx.Request;
+    if( auto valid = validateDocument( request.document() ); !valid )
+        return tl::unexpected( valid.error() );
+    if( auto busy = checkForBusy() )
+        return tl::unexpected( *busy );
+    auto fail = []( const std::string& message ) -> HANDLER_RESULT<commands::DocumentStateResponse>
+    {
+        ApiResponseStatus status;
+        status.set_status( ApiStatusCode::AS_BAD_REQUEST );
+        status.set_error_message( message );
+        return tl::unexpected( status );
+    };
+    auto fingerprint = [&]() -> std::optional<std::string>
+    {
+        HANDLER_CONTEXT<commands::SaveDocumentToString> capture;
+        capture.ClientName = aCtx.ClientName;
+        *capture.Request.mutable_document() = request.document();
+        std::string result;
+        auto saved = handleSaveDocumentToString( capture );
+        if( !saved )
+            return std::nullopt;
+        result = saved->contents();
+        return result;
+    };
+    if( !m_commits.empty() )
+        return fail( "close all edit groups before accessing document state" );
+    commands::DocumentStateResponse response;
+    if( request.action() == Request::READ )
+    {
+        response.set_project_json( pcbContext()->Prj().GetProjectFile().CaptureState() );
+        ( *response.mutable_modified() )[""] = pcbContext()->IsContentModified();
+        return response;
+    }
+    // A fresh prepare may replace abandoned staging after a client restart. Old tokens
+    // are invalidated; no live model is changed until a matching apply.
+    if( !m_restoreToken.empty() && m_restoreOwner != aCtx.ClientName
+        && request.action() != Request::PREPARE )
+        return fail( "another client owns the prepared restore" );
+    if( request.action() == Request::ABORT )
+    {
+        m_restoreDocument.reset();
+        m_restoreProject.reset();
+        m_restoreToken.clear();
+        return response;
+    }
+    if( request.action() == Request::PREPARE )
+    {
+        auto original = fingerprint();
+        if( !original )
+            return fail( "could not capture document revision" );
+        m_restoreOriginal = *original;
+        m_restoreOriginalProject = pcbContext()->Prj().GetProjectFile().CaptureState();
+        m_restoreDocument.reset();
+        wxFileName source( wxString::FromUTF8( request.source() ) );
+        if( !source.IsAbsolute() || !source.IsFileReadable() )
+            return fail( "restore source must be a readable absolute filename" );
+        wxFileName pro( source );
+        pro.SetExt( "kicad_pro" );
+        m_restoreProject = std::make_shared<API_RESTORE_PROJECT>( pro.GetFullPath() );
+        if( !m_restoreProject->GetProjectFile().RestoreState( request.project_json() ) )
+            return fail( "invalid project state" );
+        const wxString drawingSheet = BASE_SCREEN::m_DrawingSheetFileName;
+        try
+        {
+            m_restoreDocument = BOARD_LOADER::Load( source.GetFullPath(), PCB_IO_MGR::KICAD_SEXP,
+                                                m_restoreProject.get() );
+        }
+        catch( ... )
+        {
+            BASE_SCREEN::m_DrawingSheetFileName = drawingSheet;
+            return fail( "restore source could not be parsed" );
+        }
+        BASE_SCREEN::m_DrawingSheetFileName = drawingSheet;
+        if( !m_restoreDocument )
+            return fail( "restore source did not produce a document" );
+        m_restoreRequest = request;
+        m_restoreOwner = aCtx.ClientName;
+        m_restoreToken = KIID().AsStdString();
+        response.set_token( m_restoreToken );
+        return response;
+    }
+    if( request.action() != Request::APPLY || request.token() != m_restoreToken
+        || m_restoreToken.empty() || !m_restoreDocument )
+        return fail( "no matching prepared restore" );
+    const auto currentProject = nlohmann::json::parse( pcbContext()->Prj().GetProjectFile().CaptureState() );
+    if( currentProject != nlohmann::json::parse( m_restoreOriginalProject )
+        && currentProject != nlohmann::json::parse( m_restoreRequest.project_json() ) )
+        return fail( "document changed after restore was prepared (project settings)" );
+    auto current = fingerprint();
+    if( !current || *current != m_restoreOriginal )
+        return fail( "document changed after restore was prepared" );
+    m_restoreDocument->SetFileName( board()->GetFileName() );
+    m_restoreDocument->ClearProject();
+    pcbContext()->ReplaceDocument( m_restoreDocument.release() );
+    pcbContext()->Prj().GetProjectFile().RestoreState( m_restoreRequest.project_json() );
+    auto dirty = m_restoreRequest.modified().find( "" );
+    pcbContext()->SetContentModified( dirty != m_restoreRequest.modified().end() && dirty->second );
+    board()->BuildConnectivity();
+    board()->SynchronizeNetsAndNetClasses( false );
+    board()->SynchronizeTuningProfileProperties();
+    requestNetSettingsNotification();
+    Pgm().GetLibraryManager().ReloadTables( LIBRARY_TABLE_SCOPE::PROJECT,
+            { LIBRARY_TABLE_TYPE::SYMBOL, LIBRARY_TABLE_TYPE::FOOTPRINT } );
+    m_restoreProject.reset();
+    m_restoreToken.clear();
     return response;
 }

@@ -119,3 +119,14 @@ bool HEADLESS_SCH_CONTEXT::RevertToSaved()
 
     return true;
 }
+
+
+void HEADLESS_SCH_CONTEXT::ReplaceDocument( SCHEMATIC* aDocument )
+{
+    m_toolManager->ResetTools( TOOL_BASE::MODEL_RELOAD );
+    delete *m_schematicSlot;
+    *m_schematicSlot = aDocument;
+    aDocument->SetProject( m_project );
+    m_toolManager->SetEnvironment( aDocument, nullptr, nullptr, Kiface().KifaceSettings(), nullptr );
+    m_toolManager->ResetTools( TOOL_BASE::MODEL_RELOAD );
+}

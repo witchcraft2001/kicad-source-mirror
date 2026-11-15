@@ -300,6 +300,8 @@ void ZONE::Serialize( google::protobuf::Any& aContainer ) const
     kiapi::common::PackPolySet( *zone.mutable_outline(), *m_Poly );
 
     zone.set_name( m_zoneName.ToUTF8() );
+    zone.set_locked( IsLocked() ? kiapi::common::types::LS_LOCKED
+                                : kiapi::common::types::LS_UNLOCKED );
     zone.set_priority( m_priority );
     zone.set_filled( m_isFilled );
 
@@ -415,6 +417,7 @@ bool ZONE::Deserialize( const google::protobuf::Any& aContainer )
 
     SetUuidDirect( KIID( zone.id().value() ) );
     SetLayerSet( UnpackLayerSet( zone.layers() ) );
+    SetLocked( zone.locked() == kiapi::common::types::LS_LOCKED );
     SetAssignedPriority( zone.priority() );
     SetZoneName( wxString::FromUTF8( zone.name() ) );
     kiapi::common::UnpackCustomProperties( zone.custom_properties(), *this );

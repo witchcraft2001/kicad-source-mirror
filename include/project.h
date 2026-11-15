@@ -333,6 +333,7 @@ public:
     std::weak_ptr<void> GetHistoryLifetimeToken() const { return m_historyLifetime; }
 
 private:
+    friend class API_RESTORE_PROJECT;
     friend class SETTINGS_MANAGER; // so that SM can set project path
     friend class TEST_NETLISTS_FIXTURE; // TODO(JE) make this not required
 

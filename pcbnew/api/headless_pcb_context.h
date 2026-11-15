@@ -72,6 +72,8 @@ public:
 
     bool RevertToSaved() override;
 
+    void ReplaceDocument( BOARD* aDocument ) override;
+
 private:
     std::unique_ptr<BOARD> m_board;
     PROJECT* m_project;

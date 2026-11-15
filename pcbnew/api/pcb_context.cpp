@@ -19,6 +19,8 @@
  */
 
 #include <api/pcb_context.h>
+#include <tool/tool_manager.h>
+#include <pcb_draw_panel_gal.h>
 
 #include <netlist_reader/board_netlist_updater.h>
 #include <netlist_reader/pcb_netlist.h>
@@ -115,6 +117,16 @@ public:
             return false;
 
         return m_frame->ReloadFromDisk();
+    }
+
+    void ReplaceDocument( BOARD* aDocument ) override
+    {
+        m_frame->GetToolManager()->ResetTools( TOOL_BASE::MODEL_RELOAD );
+        m_frame->ClearUndoRedoList();
+        m_frame->SetBoard( aDocument );
+        m_frame->GetToolManager()->ResetTools( TOOL_BASE::MODEL_RELOAD );
+        m_frame->OnBoardLoaded();
+        m_frame->GetCanvas()->Refresh();
     }
 
 private:

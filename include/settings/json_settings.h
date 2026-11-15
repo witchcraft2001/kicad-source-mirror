@@ -151,6 +151,12 @@ public:
      */
     bool LoadFromBuffer( const std::string& aContents );
 
+    /// Capture current parameters, including nested stores, without writing a file.
+    std::string CaptureState();
+
+    /// Restore a previously captured store, including nested parameters, without saving.
+    bool RestoreState( const std::string& aContents );
+
     /**
      * Calls Store() and then writes the contents of the JSON document to a file.
      * @param aDirectory is the directory to save to, including trailing separator.

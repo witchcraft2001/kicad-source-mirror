@@ -308,3 +308,16 @@ bool HEADLESS_PCB_CONTEXT::RevertToSaved()
 
     return true;
 }
+
+
+void HEADLESS_PCB_CONTEXT::ReplaceDocument( BOARD* aDocument )
+{
+    m_toolManager->ResetTools( TOOL_BASE::MODEL_RELOAD );
+    m_board->ClearProject();
+    m_board.reset( aDocument );
+    m_board->SetProject( m_project );
+    m_toolManager->SetEnvironment( m_board.get(), nullptr, nullptr,
+                                 GetAppSettings<PCBNEW_SETTINGS>( "pcbnew" ), nullptr );
+    m_toolManager->ResetTools( TOOL_BASE::MODEL_RELOAD );
+    m_board->BuildConnectivity();
+}

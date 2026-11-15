@@ -21,6 +21,7 @@
 #ifndef KICAD_API_HANDLER_SCH_H
 #define KICAD_API_HANDLER_SCH_H
 
+#include <schematic.h>
 #include <api/api_handler_editor.h>
 #include <api/sch_context.h>
 #include <api/common/commands/cross_probe_commands.pb.h>
@@ -45,6 +46,9 @@ class SCH_ITEM;
 class SCH_SHEET;
 
 
+class PROJECT;
+class SCHEMATIC;
+
 class API_HANDLER_SCH : public API_HANDLER_EDITOR
 {
 public:
@@ -52,6 +56,16 @@ public:
     API_HANDLER_SCH( std::shared_ptr<SCH_CONTEXT> aContext, SCH_EDIT_FRAME* aFrame = nullptr );
 
 protected:
+    HANDLER_RESULT<commands::DocumentStateResponse> handleDocumentState(
+            const HANDLER_CONTEXT<commands::DocumentStateRequest>& aCtx );
+    std::shared_ptr<PROJECT> m_restoreProject;
+    std::unique_ptr<SCHEMATIC> m_restoreDocument;
+    commands::DocumentStateRequest m_restoreRequest;
+    std::string m_restoreToken;
+    std::string m_restoreOwner;
+    std::string m_restoreOriginal;
+    std::string m_restoreOriginalProject;
+
     std::optional<ApiResponseStatus> checkForHeadless( const std::string& aCommandName ) const;
 
     std::unique_ptr<COMMIT> createCommit() override;

@@ -72,6 +72,9 @@ public:
     }
 
 private:
+    HANDLER_RESULT<commands::CapabilitiesResponse> handleGetCapabilities(
+        const HANDLER_CONTEXT<commands::GetCapabilities>& aCtx );
+
     HANDLER_RESULT<commands::GetVersionResponse> handleGetVersion(
         const HANDLER_CONTEXT<commands::GetVersion>& aCtx );
 

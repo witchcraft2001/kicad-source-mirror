@@ -509,3 +509,22 @@ message ParseAndCreateItemsFromString
   // Added to the position of every created item.  Since: 11.0
   kiapi.common.types.Vector2 offset = 3;
 }
+
+// Since: 11.0. Prepare parses a detached copy; apply replaces the document in memory.
+// Source files must remain available until apply. No source project files are saved.
+message DocumentStateRequest
+{
+  kiapi.common.types.DocumentSpecifier document = 1;
+  enum Action { READ = 0; PREPARE = 1; APPLY = 2; ABORT = 3; }
+  Action action = 2;
+  string source = 3;
+  string token = 4;
+  map<string, bool> modified = 5;
+  string project_json = 6;
+}
+message DocumentStateResponse
+{
+  string token = 1;
+  string project_json = 2;
+  map<string, bool> modified = 3;
+}

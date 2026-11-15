@@ -79,6 +79,8 @@ public:
 
     void DeregisterHandler( API_HANDLER* aHandler );
 
+    std::set<std::string> SupportedCommands() const;
+
     void SetReadyToReply( bool aReady = true )
     {
         m_readyToReply.store( aReady, std::memory_order_release );

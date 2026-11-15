@@ -70,6 +70,8 @@ public:
     // Reload the board from disk, discarding unsaved changes; returns false if there is no
     // saved file to revert to or the reload failed
     virtual bool RevertToSaved() = 0;
+
+    virtual void ReplaceDocument( BOARD* aDocument ) = 0;
 };
 
 

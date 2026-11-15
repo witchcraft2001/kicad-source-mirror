@@ -21,6 +21,7 @@
 #ifndef KICAD_API_HANDLER_PCB_H
 #define KICAD_API_HANDLER_PCB_H
 
+#include <board.h>
 #include <api/api_handler_board.h>
 #include <api/pcb_context.h>
 #include <api/board/board_jobs.pb.h>
@@ -49,6 +50,9 @@ void ApplyOdbJobRequest( const kiapi::board::jobs::RunBoardJobExportODB& aReques
                          JOB_EXPORT_PCB_ODB& aJob );
 
 
+class PROJECT;
+class BOARD;
+
 class API_HANDLER_PCB : public API_HANDLER_BOARD
 {
 public:
@@ -56,6 +60,16 @@ public:
     API_HANDLER_PCB( std::shared_ptr<PCB_CONTEXT> aContext, PCB_EDIT_FRAME* aFrame = nullptr );
 
 private:
+    HANDLER_RESULT<commands::DocumentStateResponse> handleDocumentState(
+            const HANDLER_CONTEXT<commands::DocumentStateRequest>& aCtx );
+    std::shared_ptr<PROJECT> m_restoreProject;
+    std::unique_ptr<BOARD> m_restoreDocument;
+    commands::DocumentStateRequest m_restoreRequest;
+    std::string m_restoreToken;
+    std::string m_restoreOwner;
+    std::string m_restoreOriginal;
+    std::string m_restoreOriginalProject;
+
     typedef std::map<std::string, PROPERTY_BASE*> PROTO_PROPERTY_MAP;
 
     HANDLER_RESULT<commands::GetOpenDocumentsResponse> handleGetOpenDocuments(

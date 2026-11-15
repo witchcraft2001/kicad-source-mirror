@@ -66,6 +66,8 @@ public:
     // Reload the document from disk, discarding unsaved changes; returns false if there is no
     // saved file to revert to or the reload failed
     virtual bool RevertToSaved() = 0;
+
+    virtual void ReplaceDocument( SCHEMATIC* aDocument ) = 0;
 };
 
 

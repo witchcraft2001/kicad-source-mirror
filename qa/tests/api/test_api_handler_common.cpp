@@ -25,6 +25,10 @@
 #include <magic_enum.hpp>
 
 #include <api/api_handler_common.h>
+#include <settings/json_settings.h>
+#include <settings/nested_settings.h>
+#include <settings/parameters.h>
+#include <nlohmann/json.hpp>
 #include <api/common/commands/base_commands.pb.h>
 #include <api/common/envelope.pb.h>
 #include <transline_calculations/coupled_stripline.h>
@@ -70,6 +74,45 @@ double resultOf( const TransmissionLineResponse& aResponse, TransmissionLinePara
 
 
 BOOST_AUTO_TEST_SUITE( ApiHandlerCommon )
+
+BOOST_AUTO_TEST_CASE( CapturedStateIncludesDeepNestedSettings )
+{
+    class LEAF : public NESTED_SETTINGS
+    {
+    public:
+        explicit LEAF( JSON_SETTINGS* aParent ) : NESTED_SETTINGS( "leaf", 1, aParent, "leaf", false )
+        {
+            m_params.emplace_back( new PARAM<int>( "value", &value, 0 ) );
+        }
+        int value = 0;
+    };
+    JSON_SETTINGS root( wxS( "qa_restore" ), SETTINGS_LOC::NESTED, 1 );
+    NESTED_SETTINGS middle( "middle", 1, &root, "middle", false );
+    LEAF leaf( &middle );
+    leaf.value = 42;
+    const std::string captured = root.CaptureState();
+    const auto json = nlohmann::json::parse( captured );
+    BOOST_CHECK_EQUAL( json.at( "middle" ).at( "leaf" ).at( "value" ).get<int>(), 42 );
+    leaf.value = 99;
+    BOOST_REQUIRE( root.RestoreState( captured ) );
+    BOOST_CHECK_EQUAL( leaf.value, 42 );
+}
+
+
+BOOST_AUTO_TEST_CASE( CapabilitiesAreReadOnly )
+{
+    API_HANDLER_COMMON handler;
+    kiapi::common::ApiRequest request;
+    BOOST_REQUIRE( request.mutable_message()->PackFrom( GetCapabilities() ) );
+    auto result = handler.Handle( request );
+    BOOST_REQUIRE( result.has_value() );
+    CapabilitiesResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+    BOOST_CHECK_EQUAL( response.features().at( "zone_locked" ), 1 );
+    BOOST_CHECK( std::find( response.commands().begin(), response.commands().end(),
+                           GetCapabilities().GetTypeName() ) != response.commands().end() );
+}
+
 
 
 BOOST_AUTO_TEST_CASE( TransmissionLineParametersMirrorCalculator )

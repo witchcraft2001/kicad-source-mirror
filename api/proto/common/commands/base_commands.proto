@@ -33,6 +33,17 @@ message GetVersionResponse
   kiapi.common.types.KiCadVersion version = 1;
 }
 
+// Since: 11.0. Read-only discovery of registered commands and behavioural fixes.
+message GetCapabilities
+{
+}
+
+message CapabilitiesResponse
+{
+  repeated string commands = 1;
+  map<string, uint32> features = 2;
+}
+
 // A command to check if the connection to KiCad is OK
 message Ping
 {
