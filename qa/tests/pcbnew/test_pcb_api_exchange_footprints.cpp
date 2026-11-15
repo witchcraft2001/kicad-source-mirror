@@ -25,6 +25,9 @@
 #include <api/common/envelope.pb.h>
 #include <api/headless_pcb_context.h>
 #include <board.h>
+#include <component_classes/component_class_manager.h>
+#include <pcb_group.h>
+#include <zone.h>
 #include <footprint.h>
 #include <footprint_library_adapter.h>
 #include <libraries/library_manager.h>
@@ -571,5 +574,141 @@ BOOST_AUTO_TEST_CASE( PlaceFootprintFromLibrarySeesEditedLibrary )
     BOOST_CHECK( found );
 }
 
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_FIXTURE_TEST_SUITE( ApiBoardPlacement, API_EXCHANGE_FOOTPRINTS_FIXTURE )
+
+BOOST_AUTO_TEST_CASE( NativeGeometryAndAtomicPlacement )
+{
+    API_HANDLER_PCB handler( m_context );
+    GetBoardPlacementGeometry query;
+    query.mutable_board()->set_type( kiapi::common::types::DOCTYPE_PCB );
+    query.mutable_board()->set_board_filename( "exchange.kicad_pcb" );
+
+    auto invoke = [&]( const google::protobuf::Message& command )
+    {
+        kiapi::common::ApiRequest request;
+        request.mutable_header()->set_client_name( "kicad.qa.placement" );
+        BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+        return handler.Handle( request );
+    };
+    auto read = [&]()
+    {
+        auto result = invoke( query );
+        BOOST_REQUIRE( result.has_value() );
+        BOOST_REQUIRE_EQUAL( result->status().status(), ApiStatusCode::AS_OK );
+        BoardPlacementGeometryResponse response;
+        BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+        return response;
+    };
+    auto before = read();
+    BOOST_CHECK_EQUAL( before.footprints_size(), 2 );
+    BOOST_CHECK( !before.revision().empty() );
+    BOOST_CHECK_EQUAL( read().revision(), before.revision() );
+
+    for( const auto& footprint : before.footprints() )
+    {
+        BOOST_CHECK_GT( footprint.courtyard_size(), 0 );
+        BOOST_CHECK_EQUAL( footprint.pads_size(), 2 );
+        BOOST_CHECK_GT( footprint.pads( 0 ).copper_size(), 0 );
+    }
+
+    ApplyBoardPlacement apply;
+    *apply.mutable_board() = query.board();
+    apply.set_expected_revision( before.revision() );
+    apply.set_expected_project_revision( before.project_revision() );
+    apply.set_result_revision( "invalid" );
+    auto* pose = apply.add_poses();
+    pose->mutable_id()->set_value( m_r1->m_Uuid.AsStdString() );
+    pose->mutable_position()->set_x_nm( 20000000 );
+    pose->mutable_position()->set_y_nm( 30000000 );
+    pose->mutable_orientation()->set_value_degrees( 180 );
+    pose->set_layer( kiapi::board::types::BL_F_Cu );
+    const VECTOR2I original = m_r1->GetPosition();
+    const bool modified = m_context->IsContentModified();
+    auto rejected = invoke( apply );
+    BOOST_REQUIRE( !rejected.has_value() );
+    BOOST_CHECK_EQUAL( rejected.error().status(), ApiStatusCode::AS_BAD_REQUEST );
+    BOOST_CHECK( m_r1->GetPosition() == original );
+    BOOST_CHECK_EQUAL( m_context->IsContentModified(), modified );
+    BOOST_CHECK_EQUAL( read().revision(), before.revision() );
+
+    apply.set_evaluate( true );
+    auto evaluated = invoke( apply );
+    BOOST_REQUIRE( evaluated.has_value() );
+    BOOST_REQUIRE_EQUAL( evaluated->status().status(), ApiStatusCode::AS_OK );
+    ApplyBoardPlacementResponse evaluation;
+    BOOST_REQUIRE( evaluated->message().UnpackTo( &evaluation ) );
+    BOOST_CHECK_EQUAL( read().revision(), before.revision() );
+    apply.set_evaluate( false );
+    apply.set_result_revision( evaluation.revision() );
+    auto applied = invoke( apply );
+    BOOST_REQUIRE( applied.has_value() );
+    BOOST_CHECK_EQUAL( applied->status().status(), ApiStatusCode::AS_OK );
+    BOOST_CHECK_EQUAL( read().revision(), evaluation.revision() );
+    auto stale = invoke( apply );
+    BOOST_REQUIRE( !stale.has_value() );
+    BOOST_CHECK_EQUAL( stale.error().status(), ApiStatusCode::AS_BAD_REQUEST );
+}
+
+
+BOOST_AUTO_TEST_CASE( ComponentClassAreasAndIndependentDesignBlockInstances )
+{
+    m_r1->SetStaticComponentClass( m_board->GetComponentClassManager().GetEffectiveStaticComponentClass(
+            { wxS( "analog" ) } ) );
+    ZONE* area = new ZONE( m_board );
+    area->SetIsRuleArea( true );
+    area->SetLayer( F_Cu );
+    area->SetPlacementAreaEnabled( true );
+    area->SetPlacementAreaSourceType( PLACEMENT_SOURCE_T::COMPONENT_CLASS );
+    area->SetPlacementAreaSource( "analog" );
+    area->Outline()->NewOutline();
+    area->Outline()->Append( 0, 0 );
+    area->Outline()->Append( 50000000, 0 );
+    area->Outline()->Append( 50000000, 50000000 );
+    area->Outline()->Append( 0, 50000000 );
+    m_board->Add( area );
+    LIB_ID blockId;
+    blockId.Parse( "LocalBlocks:Channel" );
+
+    for( FOOTPRINT* fp : { m_r1, m_r2 } )
+    {
+        PCB_GROUP* group = new PCB_GROUP( m_board );
+        group->SetName( fp->GetReference() );
+        group->SetDesignBlockLibId( blockId );
+        group->AddItem( fp );
+        m_board->Add( group );
+    }
+
+    GetBoardPlacementGeometry command;
+    command.mutable_board()->set_type( kiapi::common::types::DOCTYPE_PCB );
+    command.mutable_board()->set_board_filename( "exchange.kicad_pcb" );
+    kiapi::common::ApiRequest request;
+    request.mutable_header()->set_client_name( "kicad.qa.placement" );
+    BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+    API_HANDLER_PCB handler( m_context );
+    auto result = handler.Handle( request );
+    BOOST_REQUIRE( result.has_value() );
+    BoardPlacementGeometryResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+    BOOST_REQUIRE_EQUAL( response.areas_size(), 1 );
+    BOOST_REQUIRE_EQUAL( response.areas( 0 ).members_size(), 1 );
+    BOOST_CHECK_EQUAL( response.areas( 0 ).members( 0 ).value(), m_r1->m_Uuid.AsStdString() );
+    BOOST_REQUIRE_EQUAL( response.groups_size(), 2 );
+    std::set<std::string> members;
+
+    for( const auto& packed : response.groups() )
+    {
+        kiapi::board::types::Group group;
+        BOOST_REQUIRE( packed.UnpackTo( &group ) );
+        BOOST_CHECK_EQUAL( group.lib_id().library_nickname(), "LocalBlocks" );
+        BOOST_CHECK_EQUAL( group.lib_id().entry_name(), "Channel" );
+        BOOST_REQUIRE_EQUAL( group.items_size(), 1 );
+        members.insert( group.items( 0 ).value() );
+    }
+
+    BOOST_CHECK_EQUAL( members.size(), 2 );
+}
 
 BOOST_AUTO_TEST_SUITE_END()

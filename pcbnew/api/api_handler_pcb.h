@@ -147,6 +147,12 @@ private:
     HANDLER_RESULT<QueryConstraintResponse> handleQueryConstraint(
             const HANDLER_CONTEXT<QueryConstraint>& aCtx );
 
+    HANDLER_RESULT<ApplyBoardPlacementResponse> handleApplyBoardPlacement(
+            const HANDLER_CONTEXT<ApplyBoardPlacement>& aCtx );
+
+    HANDLER_RESULT<BoardPlacementGeometryResponse> handleGetBoardPlacementGeometry(
+            const HANDLER_CONTEXT<GetBoardPlacementGeometry>& aCtx );
+
     HANDLER_RESULT<RouteConnectionResponse> handleRouteConnection(
             const HANDLER_CONTEXT<RouteConnection>& aCtx );
 

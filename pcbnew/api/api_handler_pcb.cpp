@@ -19,6 +19,8 @@
  */
 
 #include <magic_enum.hpp>
+#include <picosha2.h>
+#include <pcbexpr_evaluator.h>
 #include <memory>
 #include <pgm_base.h>
 #include <properties/property.h>
@@ -180,6 +182,10 @@ API_HANDLER_PCB::API_HANDLER_PCB( std::shared_ptr<PCB_CONTEXT> aContext, PCB_EDI
             &API_HANDLER_PCB::handleGetUnroutedConnections );
     registerHandler<GetNetLengths, NetLengthsResponse>( &API_HANDLER_PCB::handleGetNetLengths );
     registerHandler<QueryConstraint, QueryConstraintResponse>( &API_HANDLER_PCB::handleQueryConstraint );
+    registerHandler<ApplyBoardPlacement, ApplyBoardPlacementResponse>(
+            &API_HANDLER_PCB::handleApplyBoardPlacement );
+    registerHandler<GetBoardPlacementGeometry, BoardPlacementGeometryResponse>(
+            &API_HANDLER_PCB::handleGetBoardPlacementGeometry );
     registerHandler<RouteConnection, RouteConnectionResponse>( &API_HANDLER_PCB::handleRouteConnection );
     registerHandler<RefillZones, Empty>( &API_HANDLER_PCB::handleRefillZones );
     registerHandler<ImportNetlist, ImportNetlistResponse>( &API_HANDLER_PCB::handleImportNetlist );
@@ -4669,5 +4675,445 @@ HANDLER_RESULT<commands::DocumentStateResponse> API_HANDLER_PCB::handleDocumentS
             { LIBRARY_TABLE_TYPE::SYMBOL, LIBRARY_TABLE_TYPE::FOOTPRINT } );
     m_restoreProject.reset();
     m_restoreToken.clear();
+    return response;
+}
+
+
+HANDLER_RESULT<BoardPlacementGeometryResponse> API_HANDLER_PCB::handleGetBoardPlacementGeometry(
+        const HANDLER_CONTEXT<GetBoardPlacementGeometry>& aCtx )
+{
+    if( auto valid = validateDocument( aCtx.Request.board() ); !valid )
+        return tl::unexpected( valid.error() );
+
+    if( auto busy = checkForBusy() )
+        return tl::unexpected( *busy );
+
+    if( !m_commits.empty() )
+        return tl::unexpected( MakeResponseStatus( ApiStatusCode::AS_BAD_REQUEST,
+                                                   "close edit groups before placement analysis" ) );
+
+    HANDLER_CONTEXT<commands::SaveDocumentToString> capture;
+    capture.ClientName = aCtx.ClientName;
+    *capture.Request.mutable_document() = aCtx.Request.board();
+    auto saved = handleSaveDocumentToString( capture );
+
+    if( !saved )
+        return tl::unexpected( saved.error() );
+
+    BoardPlacementGeometryResponse response;
+    response.set_revision( picosha2::hash256_hex_string( saved->contents() ) );
+    response.set_project_revision( picosha2::hash256_hex_string(
+            pcbContext()->Prj().GetProjectFile().CaptureState() ) );
+    const int error = board()->GetDesignSettings().m_MaxError;
+    response.set_max_error_nm( error );
+
+    SHAPE_POLY_SET outline;
+    response.set_outline_valid( board()->GetBoardPolygonOutlines( outline, false ) );
+    PackPolySet( *response.mutable_outline(), outline );
+
+    for( PCB_LAYER_ID layer : board()->GetEnabledLayers().CuStack() )
+        response.add_copper_layers( ToProtoEnum<PCB_LAYER_ID, kiapi::board::types::BoardLayer>( layer ) );
+
+    auto connectivity = board()->GetConnectivity();
+
+    for( FOOTPRINT* fp : board()->Footprints() )
+    {
+        auto* result = response.add_footprints();
+        result->mutable_id()->set_value( fp->m_Uuid.AsStdString() );
+        result->set_locked( fp->IsLocked() );
+        result->set_component_classes( fp->GetComponentClassAsString().ToStdString() );
+        bool malformed = false;
+        OUTLINE_ERROR_HANDLER report = [&]( const wxString&, BOARD_ITEM*, BOARD_ITEM*, const VECTOR2I& )
+        {
+            malformed = true;
+        };
+        fp->BuildCourtyardCaches( &report );
+
+        for( PCB_LAYER_ID layer : { F_CrtYd, B_CrtYd } )
+        {
+            const auto& shape = fp->GetCourtyard( layer );
+
+            if( !shape.IsEmpty() )
+            {
+                auto* polygon = result->add_courtyard();
+                polygon->set_layer( ToProtoEnum<PCB_LAYER_ID, kiapi::board::types::BoardLayer>( layer ) );
+                PackPolySet( *polygon->mutable_shape(), shape );
+            }
+        }
+
+        if( malformed )
+            result->add_diagnostics( "malformed_courtyard" );
+
+        if( result->courtyard_size() == 0 )
+            result->add_diagnostics( "missing_courtyard" );
+
+        for( PAD* pad : fp->Pads() )
+        {
+            auto* geometry = result->add_pads();
+            geometry->mutable_id()->set_value( pad->m_Uuid.AsStdString() );
+
+            for( PCB_LAYER_ID layer : LSET( pad->GetLayerSet() & LSET::AllCuMask() ).Seq() )
+            {
+                SHAPE_POLY_SET copper;
+                pad->TransformShapeToPolygon( copper, layer, 0, error, ERROR_OUTSIDE );
+                auto* polygon = geometry->add_copper();
+                polygon->set_layer( ToProtoEnum<PCB_LAYER_ID, kiapi::board::types::BoardLayer>( layer ) );
+                PackPolySet( *polygon->mutable_shape(), copper );
+            }
+
+            SHAPE_POLY_SET hole;
+            pad->TransformHoleToPolygon( hole, 0, error, ERROR_OUTSIDE );
+            PackPolySet( *geometry->mutable_hole(), hole );
+
+            for( BOARD_CONNECTED_ITEM* item : connectivity->GetConnectedItems( pad ) )
+            {
+                geometry->add_connected_items()->set_value( item->m_Uuid.AsStdString() );
+
+                if( item->GetParentFootprint() != fp )
+                    result->set_physically_connected( true );
+            }
+        }
+    }
+
+    for( PCB_GROUP* group : board()->Groups() )
+        group->Serialize( *response.add_groups() );
+
+    for( PCB_TRACK* track : board()->Tracks() )
+        track->Serialize( *response.add_obstacles() );
+
+    for( BOARD_ITEM* drawing : board()->Drawings() )
+        drawing->Serialize( *response.add_obstacles() );
+
+    for( ZONE* zone : board()->Zones() )
+    {
+        zone->Serialize( *response.add_obstacles() );
+
+        if( !zone->GetIsRuleArea() || !zone->GetPlacementAreaEnabled() )
+            continue;
+
+        auto* area = response.add_areas();
+        area->mutable_id()->set_value( zone->m_Uuid.AsStdString() );
+        PackPolySet( *area->mutable_shape(), *zone->Outline() );
+        wxString source = zone->GetPlacementAreaSource();
+        source.Replace( "'", "\\'" );
+        wxString expression;
+
+        switch( zone->GetPlacementAreaSourceType() )
+        {
+        case PLACEMENT_SOURCE_T::SHEETNAME:
+            expression = "A.memberOfSheetOrChildren('" + source + "')";
+            break;
+        case PLACEMENT_SOURCE_T::COMPONENT_CLASS:
+            expression = "A.hasComponentClass('" + source + "')";
+            break;
+        case PLACEMENT_SOURCE_T::GROUP_PLACEMENT:
+            expression = "A.memberOfGroup('" + source + "')";
+            break;
+        case PLACEMENT_SOURCE_T::DESIGN_BLOCK:
+        {
+            EDA_GROUP* group = zone->GetParentGroup();
+
+            if( !group || !group->HasDesignBlockLink()
+                || group->GetDesignBlockLibId().GetUniStringLibId() != zone->GetPlacementAreaSource() )
+            {
+                area->add_diagnostics( "design_block_area_requires_instance_link" );
+                continue;
+            }
+
+            std::function<void( EDA_GROUP* )> collect = [&]( EDA_GROUP* node )
+            {
+                for( EDA_ITEM* member : node->GetItems() )
+                {
+                    if( member->Type() == PCB_GROUP_T )
+                        collect( static_cast<PCB_GROUP*>( member ) );
+                    else if( member->Type() == PCB_FOOTPRINT_T )
+                        area->add_members()->set_value( member->m_Uuid.AsStdString() );
+                }
+            };
+            collect( group );
+            continue;
+        }
+        }
+
+        PCBEXPR_COMPILER compiler( new PCBEXPR_UNIT_RESOLVER );
+        PCBEXPR_UCODE code;
+        PCBEXPR_CONTEXT context, preflight;
+
+        if( !compiler.Compile( expression, &code, &preflight ) )
+        {
+            area->add_diagnostics( "invalid_placement_source" );
+            continue;
+        }
+
+        for( FOOTPRINT* fp : board()->Footprints() )
+        {
+            context.SetItems( fp, fp );
+
+            if( code.Run( &context )->AsDouble() != 0.0 )
+                area->add_members()->set_value( fp->m_Uuid.AsStdString() );
+        }
+    }
+
+    return response;
+}
+
+
+HANDLER_RESULT<ApplyBoardPlacementResponse> API_HANDLER_PCB::handleApplyBoardPlacement(
+        const HANDLER_CONTEXT<ApplyBoardPlacement>& aCtx )
+{
+    auto fail = []( const std::string& message ) -> HANDLER_RESULT<ApplyBoardPlacementResponse>
+    {
+        return tl::unexpected( MakeResponseStatus( ApiStatusCode::AS_BAD_REQUEST, message ) );
+    };
+    const auto& request = aCtx.Request;
+
+    if( request.evaluate() && frame() )
+        return fail( "placement evaluation is headless-only" );
+
+    HANDLER_CONTEXT<GetBoardPlacementGeometry> query;
+    query.ClientName = aCtx.ClientName;
+    *query.Request.mutable_board() = request.board();
+    auto geometry = handleGetBoardPlacementGeometry( query );
+
+    if( !geometry )
+        return tl::unexpected( geometry.error() );
+
+    if( request.expected_revision() != geometry->revision()
+        || request.expected_project_revision() != geometry->project_revision() )
+        return fail( "placement source changed" );
+
+    if( !request.evaluate() && request.result_revision().empty() )
+        return fail( "verified placement result fingerprint required" );
+
+    std::set<std::string> allowed;
+
+    for( const auto& footprint : geometry->footprints() )
+    {
+        if( !footprint.locked() && !footprint.physically_connected()
+            && footprint.diagnostics_size() == 0 )
+            allowed.insert( footprint.id().value() );
+    }
+
+    std::map<FOOTPRINT*, const BoardPlacementPose*> poses;
+
+    for( const auto& pose : request.poses() )
+    {
+        BOARD_ITEM* item = board()->ResolveItem( KIID( pose.id().value() ), true );
+
+        if( !item || item->Type() != PCB_FOOTPRINT_T || !allowed.contains( pose.id().value() )
+            || !std::isfinite( pose.orientation().value_degrees() )
+            || pose.position().x_nm() < std::numeric_limits<int>::min()
+            || pose.position().x_nm() > std::numeric_limits<int>::max()
+            || pose.position().y_nm() < std::numeric_limits<int>::min()
+            || pose.position().y_nm() > std::numeric_limits<int>::max()
+            || ( pose.layer() != kiapi::board::types::BL_F_Cu
+                 && pose.layer() != kiapi::board::types::BL_B_Cu ) )
+            return fail( "invalid, locked, connected or unsupported placement item" );
+
+        FOOTPRINT* fp = static_cast<FOOTPRINT*>( item );
+
+        if( !poses.emplace( fp, &pose ).second )
+            return fail( "duplicate placement item" );
+
+    }
+
+    struct BlockTransform
+    {
+        VECTOR2I origin;
+        VECTOR2I destination;
+        double rotation;
+        bool flip;
+        std::set<BOARD_ITEM*> decorations;
+    };
+    std::vector<BlockTransform> blocks;
+    std::set<EDA_GROUP*> processed;
+
+    for( const auto& [fp, pose] : poses )
+    {
+        EDA_GROUP* group = fp->GetParentGroup();
+
+        if( !group )
+            continue;
+
+        std::set<EDA_GROUP*> ancestry;
+
+        while( group->AsEdaItem()->GetParentGroup() )
+        {
+            if( !ancestry.insert( group ).second )
+                return fail( "recursive group hierarchy" );
+
+            group = group->AsEdaItem()->GetParentGroup();
+        }
+
+        if( !processed.insert( group ).second )
+            continue;
+
+        std::set<BOARD_ITEM*> leaves;
+        bool locked = false;
+        std::function<void( EDA_GROUP* )> collect = [&]( EDA_GROUP* node )
+        {
+            locked |= node->AsEdaItem()->IsLocked();
+
+            for( EDA_ITEM* member : node->GetItems() )
+            {
+                if( member->Type() == PCB_GROUP_T )
+                    collect( static_cast<PCB_GROUP*>( member ) );
+                else if( member->IsBOARD_ITEM() )
+                    leaves.insert( static_cast<BOARD_ITEM*>( member ) );
+                else
+                    locked = true;
+            }
+        };
+        collect( group );
+
+        if( locked )
+            return fail( "locked rigid block" );
+
+        BlockTransform block;
+        block.origin = fp->GetPosition();
+        block.destination = UnpackVector2( pose->position() );
+        block.flip = fp->GetLayer() != FromProtoEnum<PCB_LAYER_ID>( pose->layer() );
+        block.rotation = pose->orientation().value_degrees()
+                         - ( block.flip ? -fp->GetOrientationDegrees() : fp->GetOrientationDegrees() );
+        const double angle = -block.rotation * M_PI / 180.0;
+
+        for( BOARD_ITEM* item : leaves )
+        {
+            if( item->IsLocked() )
+                return fail( "locked rigid block member" );
+
+            if( item->Type() != PCB_FOOTPRINT_T )
+            {
+                if( ( item->Type() != PCB_SHAPE_T && item->Type() != PCB_TEXT_T
+                      && item->Type() != PCB_TEXTBOX_T ) || item->IsOnCopperLayer() )
+                    return fail( "rigid block contains unsupported or copper items" );
+
+                block.decorations.insert( item );
+                continue;
+            }
+
+            FOOTPRINT* child = static_cast<FOOTPRINT*>( item );
+            auto found = poses.find( child );
+
+            if( found == poses.end() )
+                return fail( "partial rigid block placement" );
+
+            const auto* target = found->second;
+            VECTOR2I offset = child->GetPosition() - block.origin;
+
+            if( block.flip )
+                offset.x = -offset.x;
+
+            VECTOR2I expected( KiROUND( offset.x * cos( angle ) - offset.y * sin( angle ) ),
+                               KiROUND( offset.x * sin( angle ) + offset.y * cos( angle ) ) );
+            expected += block.destination;
+            const bool flip = child->GetLayer() != FromProtoEnum<PCB_LAYER_ID>( target->layer() );
+            const double rotation = target->orientation().value_degrees()
+                                    - ( flip ? -child->GetOrientationDegrees()
+                                             : child->GetOrientationDegrees() );
+
+            if( ( expected - UnpackVector2( target->position() ) ).EuclideanNorm() > 2
+                || flip != block.flip
+                || fabs( remainder( rotation - block.rotation, 360.0 ) ) > 1e-6 )
+                return fail( "placement changes the shape of a rigid block" );
+        }
+
+        blocks.push_back( std::move( block ) );
+    }
+
+    const bool modified = pcbContext()->IsContentModified();
+    auto commit = createCommit();
+    auto rollback = [&]()
+    {
+        commit->Revert();
+        pcbContext()->SetContentModified( modified );
+    };
+
+    ApplyBoardPlacementResponse response;
+
+    try
+    {
+        for( const auto& [fp, pose] : poses )
+        {
+            commit->Modify( fp );
+            const PCB_LAYER_ID layer = FromProtoEnum<PCB_LAYER_ID>( pose->layer() );
+            fp->SetLayerAndFlip( layer );
+            fp->SetOrientationDegrees( pose->orientation().value_degrees() );
+            fp->SetPosition( UnpackVector2( pose->position() ) );
+        }
+
+        for( const auto& block : blocks )
+        {
+            for( BOARD_ITEM* item : block.decorations )
+            {
+                commit->Modify( item );
+
+                if( block.flip )
+                    item->Flip( block.origin, FLIP_DIRECTION::LEFT_RIGHT );
+
+                item->Rotate( block.origin, EDA_ANGLE( block.rotation, DEGREES_T ) );
+                item->Move( block.destination - block.origin );
+            }
+        }
+
+        board()->BuildConnectivity();
+        std::vector<ZONE*> zones;
+
+        for( ZONE* zone : board()->Zones() )
+        {
+            if( !zone->GetIsRuleArea() )
+                zones.push_back( zone );
+        }
+
+        if( !zones.empty() )
+        {
+            ZONE_FILLER filler( board(), commit.get() );
+
+            if( !filler.Fill( zones ) )
+            {
+                rollback();
+                return fail( "placement zone fill failed" );
+            }
+
+            board()->BuildConnectivity();
+        }
+
+        board()->GetConnectivity()->RecalculateRatsnest();
+        HANDLER_CONTEXT<commands::SaveDocumentToString> capture;
+        capture.ClientName = aCtx.ClientName;
+        *capture.Request.mutable_document() = request.board();
+        auto saved = handleSaveDocumentToString( capture );
+
+        if( !saved )
+        {
+            rollback();
+            return tl::unexpected( saved.error() );
+        }
+
+        response.set_revision( picosha2::hash256_hex_string( saved->contents() ) );
+
+        if( request.evaluate() )
+        {
+            rollback();
+            return response;
+        }
+
+        if( request.result_revision() != response.revision() )
+        {
+            rollback();
+            return fail( "placement result differs from the verified proposal" );
+        }
+
+    }
+    catch( const std::exception& error )
+    {
+        rollback();
+        return fail( error.what() );
+    }
+
+    // Publishing failures must remain distinguishable from a rejected, reverted stage.
+    // The MCP recovery journal protects the project if the reply is lost here.
+    commit->Push( _( "Placed components via API" ), SKIP_CONNECTIVITY );
+    onModified();
     return response;
 }

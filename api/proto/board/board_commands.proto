@@ -1036,3 +1036,81 @@ message InteractiveMoveItems
 
   repeated kiapi.common.types.KIID items = 2;
 }
+
+// Native placement geometry. Coordinates are board-space nanometres. No zone fill or
+// document edits are performed by this query; filled-zone connectivity is current-state only.
+message GetBoardPlacementGeometry
+{
+  kiapi.common.types.DocumentSpecifier board = 1;
+}
+
+message PlacementPolygon
+{
+  kiapi.board.types.BoardLayer layer = 1;
+  kiapi.common.types.PolySet shape = 2;
+}
+
+message PlacementPadGeometry
+{
+  kiapi.common.types.KIID id = 1;
+  repeated PlacementPolygon copper = 2;
+  kiapi.common.types.PolySet hole = 3;
+  repeated kiapi.common.types.KIID connected_items = 4;
+}
+
+message PlacementFootprintGeometry
+{
+  kiapi.common.types.KIID id = 1;
+  repeated PlacementPolygon courtyard = 2;
+  repeated PlacementPadGeometry pads = 3;
+  bool locked = 4;
+  bool physically_connected = 5;
+  string component_classes = 6;
+  repeated string diagnostics = 7;
+}
+
+message PlacementAreaGeometry
+{
+  kiapi.common.types.KIID id = 1;
+  kiapi.common.types.PolySet shape = 2;
+  repeated kiapi.common.types.KIID members = 3;
+  repeated string diagnostics = 4;
+}
+
+message BoardPlacementGeometryResponse
+{
+  string revision = 1;
+  string project_revision = 2;
+  kiapi.common.types.PolySet outline = 3;
+  bool outline_valid = 4;
+  repeated PlacementFootprintGeometry footprints = 5;
+  repeated PlacementAreaGeometry areas = 6;
+  repeated google.protobuf.Any groups = 7;
+  repeated google.protobuf.Any obstacles = 8;
+  repeated kiapi.board.types.BoardLayer copper_layers = 9;
+  int64 max_error_nm = 10;
+}
+
+message BoardPlacementPose
+{
+  kiapi.common.types.KIID id = 1;
+  kiapi.common.types.Vector2 position = 2;
+  kiapi.common.types.Angle orientation = 3;
+  kiapi.board.types.BoardLayer layer = 4;
+}
+
+message ApplyBoardPlacement
+{
+  kiapi.common.types.DocumentSpecifier board = 1;
+  string expected_revision = 2;
+  string expected_project_revision = 3;
+  string result_revision = 4;
+  repeated BoardPlacementPose poses = 5;
+  // Headless copies only. Reverts the staged transaction after returning its hash.
+  bool evaluate = 6;
+}
+
+message ApplyBoardPlacementResponse
+{
+  string revision = 1;
+}
