@@ -712,3 +712,139 @@ BOOST_AUTO_TEST_CASE( ComponentClassAreasAndIndependentDesignBlockInstances )
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_FIXTURE_TEST_SUITE( ApiBoardDrag, API_EXCHANGE_FOOTPRINTS_FIXTURE )
+
+BOOST_AUTO_TEST_CASE( AtomicRoutingTranslationFingerprintAndRollback )
+{
+    API_HANDLER_PCB handler( m_context );
+    auto invoke = [&]( const google::protobuf::Message& command )
+    {
+        kiapi::common::ApiRequest request;
+        request.mutable_header()->set_client_name( "kicad.qa.drag" );
+        BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+        return handler.Handle( request );
+    };
+    GetBoardPlacementGeometry query;
+    query.mutable_board()->set_type( kiapi::common::types::DOCTYPE_PCB );
+    query.mutable_board()->set_board_filename( "exchange.kicad_pcb" );
+    auto read = [&]()
+    {
+        auto result = invoke( query );
+        BOOST_REQUIRE( result.has_value() );
+        BoardPlacementGeometryResponse response;
+        BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+        return response;
+    };
+    m_r1->SetValue( "Text (with parentheses) and \"quotes\"" );
+    auto original = read();
+    const bool dirty = m_context->IsContentModified();
+    const VECTOR2I origin = m_r1->GetPosition();
+    ApplyBoardRoutingChanges command;
+    *command.mutable_board() = query.board();
+    command.set_expected_revision( original.revision() );
+    command.set_expected_project_revision( original.project_revision() );
+    command.set_result_fingerprint( "forged" );
+    auto* move = command.add_translations();
+    move->mutable_id()->set_value( m_r1->m_Uuid.AsStdString() );
+    move->mutable_delta()->set_y_nm( 2000000 );
+    auto rejected = invoke( command );
+    BOOST_REQUIRE( !rejected.has_value() );
+    BOOST_CHECK_EQUAL( read().revision(), original.revision() );
+    BOOST_CHECK_EQUAL( m_context->IsContentModified(), dirty );
+    command.set_evaluate( true );
+    auto evaluation = invoke( command );
+    BOOST_REQUIRE( evaluation.has_value() );
+    ApplyBoardRoutingChangesResponse expected;
+    BOOST_REQUIRE( evaluation->message().UnpackTo( &expected ) );
+    BOOST_CHECK_EQUAL( read().revision(), original.revision() );
+    command.set_evaluate( false );
+    command.set_result_fingerprint( expected.result_fingerprint() );
+    BOOST_REQUIRE( invoke( command ).has_value() );
+    BOOST_CHECK_EQUAL( read().revision(), expected.revision() );
+    BOOST_CHECK( m_r1->GetPosition() == origin + VECTOR2I( 0, 2000000 ) );
+    BOOST_CHECK( !invoke( command ).has_value() );
+    command.set_expected_revision( expected.revision() );
+    command.mutable_translations( 0 )->mutable_id()->set_value( m_r2->m_Uuid.AsStdString() );
+    BOOST_CHECK( !invoke( command ).has_value() ); // locked source
+    BOOST_CHECK_EQUAL( read().revision(), expected.revision() );
+    command.clear_translations();
+    kiapi::board::types::Track unknown;
+    unknown.mutable_id()->set_value( KIID().AsStdString() );
+    unknown.mutable_net()->set_name( "must-not-create-this-net" );
+    command.add_add()->PackFrom( unknown );
+    BOOST_CHECK( !invoke( command ).has_value() );
+    BOOST_CHECK( m_board->FindNet( "must-not-create-this-net" ) == nullptr );
+    BOOST_CHECK_EQUAL( read().revision(), expected.revision() );
+}
+
+BOOST_AUTO_TEST_CASE( NativeComponentDragAndLockedRefusal )
+{
+    API_HANDLER_PCB handler( m_context );
+    ComputeBoardDrag command;
+    command.mutable_board()->set_type( kiapi::common::types::DOCTYPE_PCB );
+    command.mutable_board()->set_board_filename( "exchange.kicad_pcb" );
+    command.add_items()->set_value( m_r2->m_Uuid.AsStdString() );
+    command.mutable_anchor()->set_x_nm( m_r2->GetPosition().x );
+    command.mutable_anchor()->set_y_nm( m_r2->GetPosition().y );
+    *command.mutable_destination() = command.anchor();
+    command.mutable_destination()->set_y_nm( command.anchor().y_nm() + 1000000 );
+    auto invoke = [&]()
+    {
+        kiapi::common::ApiRequest request;
+        request.mutable_header()->set_client_name( "kicad.qa.drag" );
+        BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+        return handler.Handle( request );
+    };
+    BOOST_CHECK( !invoke().has_value() );
+    const VECTOR2I origin = m_r1->GetPosition();
+    command.mutable_items( 0 )->set_value( m_r1->m_Uuid.AsStdString() );
+    command.mutable_anchor()->set_x_nm( origin.x );
+    command.mutable_anchor()->set_y_nm( origin.y );
+    *command.mutable_destination() = command.anchor();
+    command.mutable_destination()->set_y_nm( origin.y + 1000000 );
+    auto result = invoke();
+    BOOST_REQUIRE( result.has_value() );
+    ComputeBoardDragResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+    BOOST_CHECK( response.success() );
+    BOOST_CHECK( m_r1->GetPosition() == origin + VECTOR2I( 0, 1000000 ) );
+}
+
+BOOST_AUTO_TEST_CASE( ZoneCreationKeepsNativeDefaults )
+{
+    ZONE defaults( m_board );
+    ZONE restored( m_board );
+    kiapi::board::types::Zone minimal;
+    minimal.set_type( kiapi::board::types::ZT_COPPER );
+    minimal.add_layers( kiapi::board::types::BL_F_Cu );
+    auto* poly = minimal.mutable_outline()->add_polygons();
+    for( const VECTOR2I point : { VECTOR2I( 0, 0 ), VECTOR2I( 10000000, 0 ),
+                                  VECTOR2I( 10000000, 10000000 ), VECTOR2I( 0, 10000000 ) } )
+    {
+        auto* p = poly->mutable_outline()->add_nodes()->mutable_point();
+        p->set_x_nm( point.x );
+        p->set_y_nm( point.y );
+    }
+    google::protobuf::Any packed;
+    packed.PackFrom( minimal );
+    BOOST_REQUIRE( restored.Deserialize( packed ) );
+    google::protobuf::Any expected;
+    defaults.Serialize( expected );
+    restored.Serialize( packed );
+    kiapi::board::types::Zone reference;
+    kiapi::board::types::Zone actual;
+    BOOST_REQUIRE( expected.UnpackTo( &reference ) );
+    BOOST_REQUIRE( packed.UnpackTo( &actual ) );
+    BOOST_CHECK_EQUAL( actual.border().pitch().value_nm(), reference.border().pitch().value_nm() );
+    BOOST_CHECK_EQUAL( actual.copper_settings().connection().zone_connection(),
+                       reference.copper_settings().connection().zone_connection() );
+    BOOST_CHECK_EQUAL( actual.copper_settings().connection().thermal_spokes().gap().value_nm(),
+                       reference.copper_settings().connection().thermal_spokes().gap().value_nm() );
+    BOOST_CHECK_EQUAL( actual.copper_settings().min_thickness().value_nm(),
+                       reference.copper_settings().min_thickness().value_nm() );
+    BOOST_CHECK_GT( actual.border().pitch().value_nm(), 0 );
+    BOOST_CHECK_GT( actual.copper_settings().min_thickness().value_nm(), 0 );
+}
+
+BOOST_AUTO_TEST_SUITE_END()

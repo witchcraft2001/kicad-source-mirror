@@ -186,6 +186,9 @@ API_HANDLER_PCB::API_HANDLER_PCB( std::shared_ptr<PCB_CONTEXT> aContext, PCB_EDI
             &API_HANDLER_PCB::handleApplyBoardPlacement );
     registerHandler<GetBoardPlacementGeometry, BoardPlacementGeometryResponse>(
             &API_HANDLER_PCB::handleGetBoardPlacementGeometry );
+    registerHandler<ComputeBoardDrag, ComputeBoardDragResponse>( &API_HANDLER_PCB::handleComputeBoardDrag );
+    registerHandler<ApplyBoardRoutingChanges, ApplyBoardRoutingChangesResponse>(
+            &API_HANDLER_PCB::handleApplyBoardRoutingChanges );
     registerHandler<RouteConnection, RouteConnectionResponse>( &API_HANDLER_PCB::handleRouteConnection );
     registerHandler<RefillZones, Empty>( &API_HANDLER_PCB::handleRefillZones );
     registerHandler<ImportNetlist, ImportNetlistResponse>( &API_HANDLER_PCB::handleImportNetlist );
@@ -4679,6 +4682,44 @@ HANDLER_RESULT<commands::DocumentStateResponse> API_HANDLER_PCB::handleDocumentS
 }
 
 
+// Net codes are runtime indices, so the native writer can reorder complete track
+// records after loading a copy. Cover every record without depending on that order.
+static std::string boardRoutingFingerprint( const std::string& text )
+{
+    std::vector<std::string> records;
+    int depth = 0;
+    size_t start = 0;
+    bool quoted = false;
+    bool escaped = false;
+    for( size_t i = 0; i < text.size(); ++i )
+    {
+        const char c = text[i];
+        if( quoted )
+        {
+            if( escaped ) escaped = false;
+            else if( c == '\\' ) escaped = true;
+            else if( c == '"' ) quoted = false;
+            continue;
+        }
+        if( c == '"' ) quoted = true;
+        else if( c == '(' )
+        {
+            if( depth == 1 ) start = i;
+            ++depth;
+        }
+        else if( c == ')' )
+        {
+            --depth;
+            if( depth == 1 ) records.push_back( text.substr( start, i - start + 1 ) );
+        }
+    }
+    std::sort( records.begin(), records.end() );
+    std::string canonical = "board-routing-v1\n";
+    for( const auto& record : records ) canonical += record + "\n";
+    return picosha2::hash256_hex_string( canonical );
+}
+
+
 HANDLER_RESULT<BoardPlacementGeometryResponse> API_HANDLER_PCB::handleGetBoardPlacementGeometry(
         const HANDLER_CONTEXT<GetBoardPlacementGeometry>& aCtx )
 {
@@ -4702,6 +4743,7 @@ HANDLER_RESULT<BoardPlacementGeometryResponse> API_HANDLER_PCB::handleGetBoardPl
 
     BoardPlacementGeometryResponse response;
     response.set_revision( picosha2::hash256_hex_string( saved->contents() ) );
+    response.set_routing_fingerprint( boardRoutingFingerprint( saved->contents() ) );
     response.set_project_revision( picosha2::hash256_hex_string(
             pcbContext()->Prj().GetProjectFile().CaptureState() ) );
     const int error = board()->GetDesignSettings().m_MaxError;
@@ -5114,6 +5156,307 @@ HANDLER_RESULT<ApplyBoardPlacementResponse> API_HANDLER_PCB::handleApplyBoardPla
     // Publishing failures must remain distinguishable from a rejected, reverted stage.
     // The MCP recovery journal protects the project if the reply is lost here.
     commit->Push( _( "Placed components via API" ), SKIP_CONNECTIVITY );
+    onModified();
+    return response;
+}
+
+
+HANDLER_RESULT<ComputeBoardDragResponse> API_HANDLER_PCB::handleComputeBoardDrag(
+        const HANDLER_CONTEXT<ComputeBoardDrag>& aCtx )
+{
+    auto fail = []( const std::string& message ) -> HANDLER_RESULT<ComputeBoardDragResponse>
+    {
+        return tl::unexpected( MakeResponseStatus( ApiStatusCode::AS_BAD_REQUEST, message ) );
+    };
+    if( frame() )
+        return fail( "drag computation requires an isolated headless document" );
+    if( auto valid = validateDocument( aCtx.Request.board() ); !valid )
+        return tl::unexpected( valid.error() );
+    if( auto busy = checkForBusy() )
+        return tl::unexpected( *busy );
+    if( !m_commits.empty() )
+        return fail( "close edit groups before drag computation" );
+    if( aCtx.Request.items().empty() )
+        return fail( "drag requires items" );
+    if( aCtx.Request.collision_mode() == RouterCollisionMode::RCM_MARK_OBSTACLES )
+        return fail( "drag cannot ignore obstacles" );
+
+    auto inRange = []( const kiapi::common::types::Vector2& p )
+    {
+        return p.x_nm() >= std::numeric_limits<int>::min() && p.x_nm() <= std::numeric_limits<int>::max()
+               && p.y_nm() >= std::numeric_limits<int>::min() && p.y_nm() <= std::numeric_limits<int>::max();
+    };
+    if( !inRange( aCtx.Request.anchor() ) || !inRange( aCtx.Request.destination() ) )
+        return fail( "drag coordinates exceed board limits" );
+    std::set<KIID> unique;
+    std::vector<BOARD_CONNECTED_ITEM*> primitives;
+    bool components = false;
+    for( const auto& id : aCtx.Request.items() )
+    {
+        BOARD_ITEM* item = board()->ResolveItem( KIID( id.value() ), true );
+        if( !item || !unique.insert( item->m_Uuid ).second || item->IsLocked() || item->GetParentGroup() )
+            return fail( "missing, locked or grouped drag item; detach groups explicitly first" );
+        if( item->Type() == PCB_FOOTPRINT_T )
+        {
+            components = true;
+            for( PAD* pad : static_cast<FOOTPRINT*>( item )->Pads() )
+            {
+                if( pad->IsLocked() )
+                    return fail( "locked drag pad" );
+                primitives.push_back( pad );
+            }
+        }
+        else if( item->Type() == PCB_TRACE_T || item->Type() == PCB_ARC_T || item->Type() == PCB_VIA_T )
+            primitives.push_back( static_cast<BOARD_CONNECTED_ITEM*>( item ) );
+        else
+            return fail( "only footprints, tracks, arcs and vias can be dragged" );
+    }
+    if( components && primitives.size() == 0 )
+        return fail( "component has no router pads" );
+    if( auto engine = board()->GetDesignSettings().m_DRCEngine )
+    {
+        try
+        {
+            engine->InitEngine( board()->GetDesignRulesPath() );
+        }
+        catch( const PARSE_ERROR& error )
+        {
+            return fail( error.What().ToStdString() );
+        }
+    }
+    API_PNS_IFACE iface( board(), toolManager(), _( "Drag via API" ) );
+    PNS::ROUTER router;
+    router.SetInterface( &iface );
+    router.SyncWorld();
+    PNS::ROUTING_SETTINGS settings( nullptr, "" );
+    settings.SetMode( aCtx.Request.collision_mode() == RouterCollisionMode::RCM_SHOVE
+                      ? PNS::RM_Shove : PNS::RM_Walkaround );
+    router.LoadSettings( &settings );
+    PNS::ITEM_SET items;
+    for( BOARD_CONNECTED_ITEM* primitive : primitives )
+    {
+        PNS::ITEM* item = router.GetWorld()->FindItemByParent( primitive );
+        if( !item )
+            return fail( "item is not represented in the router world" );
+        items.Add( item );
+    }
+    ComputeBoardDragResponse response;
+    VECTOR2I anchor = UnpackVector2( aCtx.Request.anchor() );
+    VECTOR2I destination = UnpackVector2( aCtx.Request.destination() );
+    if( !router.StartDragging( anchor, items, components ? PNS::DM_COMPONENT : PNS::DM_ANY )
+        || !router.Move( destination, nullptr ) || !router.FixRoute( destination, nullptr, false, false ) )
+    {
+        response.set_failure_reason( router.FailureReason().ToStdString() );
+        router.StopRouting();
+        return response;
+    }
+    router.CommitRouting();
+    router.StopRouting();
+    board()->BuildConnectivity();
+    board()->GetConnectivity()->RecalculateRatsnest();
+    response.set_success( iface.Committed() );
+    if( iface.Committed() )
+        onModified();
+    return response;
+}
+
+
+HANDLER_RESULT<ApplyBoardRoutingChangesResponse> API_HANDLER_PCB::handleApplyBoardRoutingChanges(
+        const HANDLER_CONTEXT<ApplyBoardRoutingChanges>& aCtx )
+{
+    auto fail = []( const std::string& message ) -> HANDLER_RESULT<ApplyBoardRoutingChangesResponse>
+    {
+        return tl::unexpected( MakeResponseStatus( ApiStatusCode::AS_BAD_REQUEST, message ) );
+    };
+    const auto& request = aCtx.Request;
+    if( request.evaluate() && frame() )
+        return fail( "routing evaluation is headless-only" );
+    HANDLER_CONTEXT<GetBoardPlacementGeometry> query;
+    query.ClientName = aCtx.ClientName;
+    *query.Request.mutable_board() = request.board();
+    auto geometry = handleGetBoardPlacementGeometry( query );
+    if( !geometry )
+        return tl::unexpected( geometry.error() );
+    if( geometry->revision() != request.expected_revision()
+        || geometry->project_revision() != request.expected_project_revision() )
+        return fail( "routing source changed" );
+    if( !request.evaluate() && request.result_fingerprint().empty() )
+        return fail( "verified routing result fingerprint required" );
+    auto locked = []( BOARD_ITEM* item )
+    {
+        if( item->IsLocked() )
+            return true;
+        std::set<EDA_GROUP*> seen;
+        for( EDA_GROUP* g = item->GetParentGroup(); g; g = g->AsEdaItem()->GetParentGroup() )
+        {
+            if( !seen.insert( g ).second || g->AsEdaItem()->IsLocked() )
+                return true;
+        }
+        return false;
+    };
+    std::set<KIID> scope;
+    for( const auto& id : request.copper_scope() )
+        scope.insert( KIID( id.value() ) );
+    std::vector<BOARD_ITEM*> removed;
+    std::set<KIID> ids;
+    for( const auto& id : request.remove() )
+    {
+        BOARD_ITEM* item = board()->ResolveItem( KIID( id.value() ), true );
+        if( !item || !ids.insert( item->m_Uuid ).second || !scope.contains( item->m_Uuid )
+            || locked( item ) || item->GetParentGroup()
+            || ( item->Type() != PCB_TRACE_T && item->Type() != PCB_ARC_T && item->Type() != PCB_VIA_T ) )
+            return fail( "invalid, locked, grouped or out-of-scope copper removal" );
+        removed.push_back( item );
+    }
+    std::vector<std::unique_ptr<BOARD_ITEM>> added;
+    std::set<KIID> newIds;
+    for( const auto& packed : request.add() )
+    {
+        std::unique_ptr<BOARD_ITEM> item;
+        std::string netName;
+        if( packed.Is<kiapi::board::types::Track>() )
+        {
+            kiapi::board::types::Track track;
+            packed.UnpackTo( &track );
+            netName = track.net().name();
+            item = std::make_unique<PCB_TRACK>( board() );
+        }
+        else if( packed.Is<kiapi::board::types::Arc>() )
+        {
+            kiapi::board::types::Arc arc;
+            packed.UnpackTo( &arc );
+            netName = arc.net().name();
+            item = std::make_unique<PCB_ARC>( board() );
+        }
+        else if( packed.Is<kiapi::board::types::Via>() )
+        {
+            kiapi::board::types::Via via;
+            packed.UnpackTo( &via );
+            netName = via.net().name();
+            item = std::make_unique<PCB_VIA>( board() );
+        }
+        else
+        {
+            return fail( "routing may add only tracks, arcs and vias" );
+        }
+
+        // UnpackNet creates a net when missing. Refuse it before Deserialize so
+        // malformed proposals cannot mutate the net table outside the commit.
+        if( !board()->FindNet( wxString::FromUTF8( netName ) ) )
+            return fail( "routing addition refers to an unknown net" );
+        if( !item->Deserialize( packed ) || locked( item.get() )
+            || !newIds.insert( item->m_Uuid ).second
+            || ( board()->ResolveItem( item->m_Uuid, true ) && !ids.contains( item->m_Uuid ) ) )
+            return fail( "invalid routing addition or duplicate UUID" );
+        added.push_back( std::move( item ) );
+    }
+    std::map<FOOTPRINT*, VECTOR2I> translations;
+    for( const auto& move : request.translations() )
+    {
+        BOARD_ITEM* item = board()->ResolveItem( KIID( move.id().value() ), true );
+        if( !item || item->Type() != PCB_FOOTPRINT_T || locked( item ) || item->GetParentGroup()
+            || move.delta().x_nm() < std::numeric_limits<int>::min()
+            || move.delta().x_nm() > std::numeric_limits<int>::max()
+            || move.delta().y_nm() < std::numeric_limits<int>::min()
+            || move.delta().y_nm() > std::numeric_limits<int>::max()
+            || !translations.emplace( static_cast<FOOTPRINT*>( item ), UnpackVector2( move.delta() ) ).second )
+            return fail( "invalid, locked or grouped footprint translation" );
+        for( PAD* pad : static_cast<FOOTPRINT*>( item )->Pads() )
+        {
+            if( pad->IsLocked() )
+                return fail( "locked footprint pad" );
+        }
+        const int64_t x = int64_t( item->GetPosition().x ) + move.delta().x_nm();
+        const int64_t y = int64_t( item->GetPosition().y ) + move.delta().y_nm();
+        if( x < std::numeric_limits<int>::min() || x > std::numeric_limits<int>::max()
+            || y < std::numeric_limits<int>::min() || y > std::numeric_limits<int>::max() )
+            return fail( "translated footprint exceeds board limits" );
+    }
+    if( auto engine = board()->GetDesignSettings().m_DRCEngine )
+    {
+        try
+        {
+            engine->InitEngine( board()->GetDesignRulesPath() );
+        }
+        catch( const PARSE_ERROR& error )
+        {
+            return fail( error.What().ToStdString() );
+        }
+    }
+    const bool modified = pcbContext()->IsContentModified();
+    auto commit = createCommit();
+    auto rollback = [&]()
+    {
+        commit->Revert();
+        board()->BuildConnectivity();
+        board()->GetConnectivity()->RecalculateRatsnest();
+        pcbContext()->SetContentModified( modified );
+    };
+    ApplyBoardRoutingChangesResponse response;
+    try
+    {
+        for( const auto& [fp, delta] : translations )
+        {
+            commit->Modify( fp );
+            fp->Move( delta );
+        }
+        for( BOARD_ITEM* item : removed )
+        {
+            board()->Remove( item );
+            commit->Removed( item );
+        }
+        for( auto& item : added )
+        {
+            BOARD_ITEM* raw = item.release();
+            board()->Add( raw );
+            commit->Added( raw );
+        }
+        board()->BuildConnectivity();
+        std::vector<ZONE*> zones;
+        for( ZONE* zone : board()->Zones() )
+        {
+            if( !zone->GetIsRuleArea() )
+                zones.push_back( zone );
+        }
+        if( !zones.empty() )
+        {
+            ZONE_FILLER filler( board(), commit.get() );
+            if( !filler.Fill( zones ) )
+            {
+                rollback();
+                return fail( "routing zone fill failed" );
+            }
+            board()->BuildConnectivity();
+        }
+        board()->GetConnectivity()->RecalculateRatsnest();
+        HANDLER_CONTEXT<commands::SaveDocumentToString> capture;
+        capture.ClientName = aCtx.ClientName;
+        *capture.Request.mutable_document() = request.board();
+        auto saved = handleSaveDocumentToString( capture );
+        if( !saved )
+        {
+            rollback();
+            return tl::unexpected( saved.error() );
+        }
+        response.set_revision( picosha2::hash256_hex_string( saved->contents() ) );
+        response.set_result_fingerprint( boardRoutingFingerprint( saved->contents() ) );
+        if( request.evaluate() )
+        {
+            rollback();
+            return response;
+        }
+        if( request.result_fingerprint() != response.result_fingerprint() )
+        {
+            rollback();
+            return fail( "routing result differs from the verified proposal" );
+        }
+    }
+    catch( const std::exception& error )
+    {
+        rollback();
+        return fail( error.what() );
+    }
+    commit->Push( _( "Drag and locally reroute via API" ), SKIP_CONNECTIVITY );
     onModified();
     return response;
 }

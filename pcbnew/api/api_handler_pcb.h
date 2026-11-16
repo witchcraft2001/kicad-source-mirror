@@ -153,6 +153,11 @@ private:
     HANDLER_RESULT<BoardPlacementGeometryResponse> handleGetBoardPlacementGeometry(
             const HANDLER_CONTEXT<GetBoardPlacementGeometry>& aCtx );
 
+    HANDLER_RESULT<ComputeBoardDragResponse> handleComputeBoardDrag(
+            const HANDLER_CONTEXT<ComputeBoardDrag>& aCtx );
+    HANDLER_RESULT<ApplyBoardRoutingChangesResponse> handleApplyBoardRoutingChanges(
+            const HANDLER_CONTEXT<ApplyBoardRoutingChanges>& aCtx );
+
     HANDLER_RESULT<RouteConnectionResponse> handleRouteConnection(
             const HANDLER_CONTEXT<RouteConnection>& aCtx );
 

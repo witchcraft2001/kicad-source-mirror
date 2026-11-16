@@ -449,13 +449,24 @@ bool ZONE::Deserialize( const google::protobuf::Any& aContainer )
     else
     {
         const types::CopperZoneSettings& cu = zone.copper_settings();
-        m_PadConnection = FromProtoEnum<ZONE_CONNECTION>( cu.connection().zone_connection() );
-        m_thermalReliefSpokeWidth = cu.connection().thermal_spokes().width().value_nm();
-        m_thermalReliefGap = cu.connection().thermal_spokes().gap().value_nm();
-        m_ZoneClearance = cu.clearance().value_nm();
-        m_ZoneMinThickness = cu.min_thickness().value_nm();
-        m_islandRemovalMode = FromProtoEnum<ISLAND_REMOVAL_MODE>( cu.island_mode() );
-        m_minIslandArea = cu.min_island_area();
+        // New API zones start with the project's native defaults. Absent protobuf
+        // messages/enums must not replace them with zero/UNKNOWN: in particular an
+        // unknown pad connection cannot survive a save/load round trip faithfully.
+        if( cu.connection().zone_connection() != types::ZCS_UNKNOWN )
+            m_PadConnection = FromProtoEnum<ZONE_CONNECTION>( cu.connection().zone_connection() );
+        if( cu.connection().thermal_spokes().has_width() )
+            m_thermalReliefSpokeWidth = cu.connection().thermal_spokes().width().value_nm();
+        if( cu.connection().thermal_spokes().has_gap() )
+            m_thermalReliefGap = cu.connection().thermal_spokes().gap().value_nm();
+        if( cu.has_clearance() )
+            m_ZoneClearance = cu.clearance().value_nm();
+        if( cu.has_min_thickness() )
+            m_ZoneMinThickness = cu.min_thickness().value_nm();
+        if( cu.island_mode() != types::IRM_UNKNOWN )
+        {
+            m_islandRemovalMode = FromProtoEnum<ISLAND_REMOVAL_MODE>( cu.island_mode() );
+            m_minIslandArea = cu.min_island_area();
+        }
         // Route through SetFillMode so the thieving single-layer / net-less invariants
         // are enforced on protobuf imports — a direct m_fillMode assignment would leave
         // the multi-layer set unpacked at line 355 in place for ZFM_COPPER_THIEVING.
@@ -468,11 +479,14 @@ bool ZONE::Deserialize( const google::protobuf::Any& aContainer )
         else
             SetCornerRadius( 0 );
 
-        m_hatchThickness = cu.hatch_settings().thickness().value_nm();
-        m_hatchGap = cu.hatch_settings().gap().value_nm();
-        m_hatchOrientation = EDA_ANGLE( cu.hatch_settings().orientation().value_degrees(), DEGREES_T );
-        m_hatchSmoothingValue = cu.hatch_settings().hatch_smoothing_ratio();
-        m_hatchHoleMinArea = cu.hatch_settings().hatch_hole_min_area_ratio();
+        if( cu.has_hatch_settings() )
+        {
+            m_hatchThickness = cu.hatch_settings().thickness().value_nm();
+            m_hatchGap = cu.hatch_settings().gap().value_nm();
+            m_hatchOrientation = EDA_ANGLE( cu.hatch_settings().orientation().value_degrees(), DEGREES_T );
+            m_hatchSmoothingValue = cu.hatch_settings().hatch_smoothing_ratio();
+            m_hatchHoleMinArea = cu.hatch_settings().hatch_hole_min_area_ratio();
+        }
 
         switch( cu.hatch_settings().border_mode() )
         {
@@ -518,8 +532,12 @@ bool ZONE::Deserialize( const google::protobuf::Any& aContainer )
         }
     }
 
-    m_borderStyle = FromProtoEnum<ZONE_BORDER_DISPLAY_STYLE>( zone.border().style() );
-    m_borderHatchPitch = zone.border().pitch().value_nm();
+    if( zone.has_border() )
+    {
+        m_borderStyle = FromProtoEnum<ZONE_BORDER_DISPLAY_STYLE>( zone.border().style() );
+        if( zone.border().has_pitch() )
+            m_borderHatchPitch = zone.border().pitch().value_nm();
+    }
 
     if( zone.filled() )
     {

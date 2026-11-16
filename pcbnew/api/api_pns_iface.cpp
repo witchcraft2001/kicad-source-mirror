@@ -22,6 +22,8 @@
 #include <board.h>
 #include <board_commit.h>
 #include <board_item.h>
+#include <footprint.h>
+#include <pad.h>
 #include <router/pns_item.h>
 
 
@@ -55,8 +57,17 @@ void API_PNS_IFACE::RemoveItem( PNS::ITEM* aItem )
 
 void API_PNS_IFACE::Commit()
 {
-    // The interactive version also re-groups items and moves dragged footprints; neither applies
-    // to routing requests, which never drag components.
+    // Apply each footprint offset once, even when several pads were dragged.
+    std::set<FOOTPRINT*> moved;
+    for( const auto& [pad, offset] : m_fpOffsets )
+    {
+        FOOTPRINT* fp = pad->GetParentFootprint();
+        if( moved.insert( fp ).second )
+        {
+            m_commit->Modify( fp );
+            fp->Move( offset.p_new - offset.p_old );
+        }
+    }
     m_fpOffsets.clear();
     m_itemGroups.clear();
     m_removedItems.clear();

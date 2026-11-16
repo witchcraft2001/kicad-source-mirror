@@ -110,11 +110,17 @@ HANDLER_RESULT<CapabilitiesResponse> API_HANDLER_COMMON::handleGetCapabilities(
     for( const std::string& name : commands )
         response.add_commands( name );
 
+    ( *response.mutable_features() )["board_router_drag"] =
+            commands.contains( "kiapi.board.commands.ComputeBoardDrag" ) ? 1 : 0;
+    ( *response.mutable_features() )["board_routing_apply"] =
+            commands.contains( "kiapi.board.commands.ApplyBoardRoutingChanges" ) ? 1 : 0;
     ( *response.mutable_features() )["board_placement_apply"] =
             commands.contains( "kiapi.board.commands.ApplyBoardPlacement" ) ? 1 : 0;
     ( *response.mutable_features() )["board_placement_geometry"] =
             commands.contains( "kiapi.board.commands.GetBoardPlacementGeometry" ) ? 1 : 0;
     ( *response.mutable_features() )["zone_locked"] = 1;
+    ( *response.mutable_features() )["board_zone_defaults"] =
+            commands.contains( "kiapi.board.commands.GetBoardPlacementGeometry" ) ? 1 : 0;
     ( *response.mutable_features() )["netclass_line_style"] = 1;
     ( *response.mutable_features() )["schematic_source_package"] = 1;
     ( *response.mutable_features() )["schematic_layout_geometry"] =

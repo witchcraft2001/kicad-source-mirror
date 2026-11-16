@@ -1089,6 +1089,8 @@ message BoardPlacementGeometryResponse
   repeated google.protobuf.Any obstacles = 8;
   repeated kiapi.board.types.BoardLayer copper_layers = 9;
   int64 max_error_nm = 10;
+  // Complete board records, ordered independently of runtime net codes.
+  string routing_fingerprint = 11;
 }
 
 message BoardPlacementPose
@@ -1113,4 +1115,45 @@ message ApplyBoardPlacement
 message ApplyBoardPlacementResponse
 {
   string revision = 1;
+}
+
+// PNS drag computes only in isolated headless documents. Review and validation are
+// followed by ApplyBoardRoutingChanges on the live editor.
+message ComputeBoardDrag
+{
+  kiapi.common.types.DocumentSpecifier board = 1;
+  repeated kiapi.common.types.KIID items = 2;
+  kiapi.common.types.Vector2 anchor = 3;
+  kiapi.common.types.Vector2 destination = 4;
+  RouterCollisionMode collision_mode = 5;
+}
+message ComputeBoardDragResponse
+{
+  bool success = 1;
+  string failure_reason = 2;
+}
+message BoardDragTranslation
+{
+  kiapi.common.types.KIID id = 1;
+  kiapi.common.types.Vector2 delta = 2;
+}
+// Only footprint translations and explicitly scoped track/arc/via changes.
+// Zones, settings, net assignments and footprint definitions cannot be replaced.
+message ApplyBoardRoutingChanges
+{
+  kiapi.common.types.DocumentSpecifier board = 1;
+  string expected_revision = 2;
+  string expected_project_revision = 3;
+  // Canonical top-level board record digest; independent of transient net-code order.
+  string result_fingerprint = 4;
+  repeated BoardDragTranslation translations = 5;
+  repeated kiapi.common.types.KIID remove = 6;
+  repeated google.protobuf.Any add = 7;
+  repeated kiapi.common.types.KIID copper_scope = 8;
+  bool evaluate = 9;
+}
+message ApplyBoardRoutingChangesResponse
+{
+  string revision = 1;
+  string result_fingerprint = 2;
 }
