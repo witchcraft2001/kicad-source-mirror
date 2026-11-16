@@ -121,6 +121,8 @@ HANDLER_RESULT<CapabilitiesResponse> API_HANDLER_COMMON::handleGetCapabilities(
     ( *response.mutable_features() )["zone_locked"] = 1;
     ( *response.mutable_features() )["board_zone_defaults"] =
             commands.contains( "kiapi.board.commands.GetBoardPlacementGeometry" ) ? 1 : 0;
+    ( *response.mutable_features() )["board_rule_severity_preservation"] =
+            commands.contains( "kiapi.board.commands.SetBoardDesignRules" ) ? 1 : 0;
     ( *response.mutable_features() )["netclass_line_style"] = 1;
     ( *response.mutable_features() )["schematic_source_package"] = 1;
     ( *response.mutable_features() )["schematic_layout_geometry"] =

@@ -25,6 +25,8 @@
 #include <api/common/envelope.pb.h>
 #include <api/headless_pcb_context.h>
 #include <board.h>
+#include <board_design_settings.h>
+#include <drc/drc_item.h>
 #include <component_classes/component_class_manager.h>
 #include <pcb_group.h>
 #include <zone.h>
@@ -845,6 +847,59 @@ BOOST_AUTO_TEST_CASE( ZoneCreationKeepsNativeDefaults )
                        reference.copper_settings().min_thickness().value_nm() );
     BOOST_CHECK_GT( actual.border().pitch().value_nm(), 0 );
     BOOST_CHECK_GT( actual.copper_settings().min_thickness().value_nm(), 0 );
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_FIXTURE_TEST_SUITE( ApiBoardRuleState, API_EXCHANGE_FOOTPRINTS_FIXTURE )
+
+BOOST_AUTO_TEST_CASE( RuleRoundTripPreservesNativeOnlySeverities )
+{
+    API_HANDLER_PCB handler( m_context );
+    auto invoke = [&]( const google::protobuf::Message& command )
+    {
+        kiapi::common::ApiRequest request;
+        request.mutable_header()->set_client_name( "kicad.qa.rules" );
+        BOOST_REQUIRE( request.mutable_message()->PackFrom( command ) );
+        return handler.Handle( request );
+    };
+
+    auto& settings = m_board->GetDesignSettings();
+    settings.m_DRCSeverities[DRCE_VIA_STITCH_OVERLAP] = RPT_SEVERITY_WARNING;
+    const auto expected = settings.m_DRCSeverities;
+    GetBoardDesignRules query;
+    query.mutable_board()->set_type( kiapi::common::types::DOCTYPE_PCB );
+    query.mutable_board()->set_board_filename( "exchange.kicad_pcb" );
+    auto result = invoke( query );
+    BOOST_REQUIRE( result.has_value() );
+    BoardDesignRulesResponse response;
+    BOOST_REQUIRE( result->message().UnpackTo( &response ) );
+
+    for( const auto& severity : response.rules().severities() )
+        BOOST_CHECK( severity.rule_type() != kiapi::board::DRCET_UNKNOWN );
+
+    SetBoardDesignRules update;
+    *update.mutable_board() = query.board();
+    *update.mutable_rules() = response.rules();
+    result = invoke( update );
+    BOOST_REQUIRE( result.has_value() );
+    BOOST_CHECK( m_board->GetDesignSettings().m_DRCSeverities == expected );
+
+    // A partial client may omit all severities when only editing dimensions.
+    update.mutable_rules()->clear_severities();
+    result = invoke( update );
+    BOOST_REQUIRE( result.has_value() );
+    BOOST_CHECK( m_board->GetDesignSettings().m_DRCSeverities == expected );
+
+    auto* severity = update.mutable_rules()->add_severities();
+    severity->set_rule_type( kiapi::board::DRCET_TRACK_WIDTH );
+    severity->set_severity( kiapi::common::types::RS_WARNING );
+    result = invoke( update );
+    BOOST_REQUIRE( result.has_value() );
+    BOOST_CHECK_EQUAL( m_board->GetDesignSettings().m_DRCSeverities.at( DRCE_TRACK_WIDTH ),
+                       RPT_SEVERITY_WARNING );
+    BOOST_CHECK_EQUAL( m_board->GetDesignSettings().m_DRCSeverities.at( DRCE_VIA_STITCH_OVERLAP ),
+                       RPT_SEVERITY_WARNING );
 }
 
 BOOST_AUTO_TEST_SUITE_END()

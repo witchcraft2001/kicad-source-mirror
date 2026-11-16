@@ -1050,9 +1050,16 @@ HANDLER_RESULT<BoardDesignRulesResponse> API_HANDLER_PCB::handleGetBoardDesignRu
 
     for( const auto& [errorCode, severity] : bds.m_DRCSeverities )
     {
+        const auto type = ToProtoEnum<PCB_DRC_CODE, board::DrcErrorType>(
+                static_cast<PCB_DRC_CODE>( errorCode ) );
+
+        // Native checks can precede their public API enum.  An UNKNOWN entry
+        // cannot carry their identity through a read/modify/write cycle.
+        if( type == board::DrcErrorType::DRCET_UNKNOWN )
+            continue;
+
         board::DrcSeveritySetting* setting = rules->add_severities();
-        setting->set_rule_type(
-                ToProtoEnum<PCB_DRC_CODE, board::DrcErrorType>( static_cast<PCB_DRC_CODE>( errorCode ) ) );
+        setting->set_rule_type( type );
         setting->set_severity( ToProtoEnum<SEVERITY, types::RuleSeverity>( severity ) );
     }
 
@@ -1223,10 +1230,14 @@ HANDLER_RESULT<BoardDesignRulesResponse> API_HANDLER_PCB::handleSetBoardDesignRu
         newSettings.m_FillVias = viaProtection.fill();
     }
 
-    newSettings.m_DRCSeverities.clear();
-
+    // Preserve omitted native checks, including ones not represented by this
+    // API version.  Clearing them changes CaptureState after a restore and
+    // loses their configured severity when editing an unrelated minimum.
     for( const kiapi::board::DrcSeveritySetting& severitySetting : rules.severities() )
     {
+        if( severitySetting.rule_type() == board::DrcErrorType::DRCET_UNKNOWN )
+            continue;
+
         PCB_DRC_CODE ruleType =
                 FromProtoEnum<PCB_DRC_CODE, kiapi::board::DrcErrorType>( severitySetting.rule_type() );
 
